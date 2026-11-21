@@ -336,6 +336,8 @@ impl Pane {
         let Some(info) = self.files.item(pos) else { return };
         let Some(f) = files::info_file(&info) else { return };
         if matches!(info.file_type(), gio::FileType::Directory | gio::FileType::Mountable) {
+            // a shortcut (symlink) to a folder opens the real folder, like Windows
+            let f = symlink_target(&info, &f).unwrap_or(f);
             self.go(Loc::Files(f), true);
         } else if let Some(w) = self.win() {
             w.launch(&f);
@@ -375,6 +377,28 @@ impl Pane {
             open.append(Some("Open in new tab"), Some(&action("win.open-tab", &uri)));
             open.append(Some("Open in split view"), Some(&action("win.open-split", &uri)));
         }
+        if !is_dir && !self.in_trash() {
+            if let Some(ct) = first.content_type() {
+                let with = gio::Menu::new();
+                let default = gio::AppInfo::default_for_type(&ct, false).and_then(|a| a.id());
+                for a in gio::AppInfo::recommended_for_type(&ct).into_iter().take(8) {
+                    let Some(id) = a.id() else { continue };
+                    let label = if Some(&id) == default.as_ref() { format!("{} (default)", a.name()) } else { a.name().to_string() };
+                    let item = gio::MenuItem::new(Some(&label), Some(&action("win.open-with", &id)));
+                    if let Some(ic) = a.icon() {
+                        item.set_icon(&ic);
+                    }
+                    with.append_item(&item);
+                }
+                let other = gio::Menu::new();
+                other.append(Some("Choose application…"), Some(&action("win.choose-app", &ct)));
+                with.append_section(None, &other);
+                open.append_submenu(Some("Open with"), &with);
+            }
+        }
+        if is_dir && sel.len() == 1 && f.is_native() {
+            open.append(Some("Open terminal here"), Some(&action("win.terminal", &uri)));
+        }
         menu.append_section(None, &open);
         if is_dir && sel.len() == 1 {
             let side = gio::Menu::new();
@@ -402,6 +426,9 @@ impl Pane {
         }
         menu.append_section(None, &edit);
         let misc = gio::Menu::new();
+        if sel.len() == 1 && f.is_native() && !self.in_trash() {
+            misc.append(Some("Create shortcut…"), Some(&action("win.shortcut", &uri)));
+        }
         misc.append(Some("Copy path"), Some(&action("win.copy-path", &uri)));
         menu.append_section(None, &misc);
         let danger = gio::Menu::new();
@@ -423,8 +450,25 @@ impl Pane {
         let menu = gio::Menu::new();
         if !self.in_trash() {
             let edit = gio::Menu::new();
-            edit.append(Some("New folder…"), Some("win.new-folder"));
+            let new = gio::Menu::new();
+            new.append(Some("Folder…"), Some("win.new-folder"));
+            let docs = gio::Menu::new();
+            docs.append(Some("Text document (.txt)"), Some(&action("win.new-file", "txt")));
+            docs.append(Some("Shell script (.sh)"), Some(&action("win.new-file", "sh")));
+            docs.append(Some("Empty file"), Some(&action("win.new-file", "empty")));
+            new.append_section(None, &docs);
+            let tpl = gio::Menu::new();
+            for t in super::create::templates() {
+                tpl.append(Some(&display_name(&t, &w.home)), Some(&action("win.new-template", &t.uri())));
+            }
+            if tpl.n_items() > 0 {
+                new.append_section(Some("Templates"), &tpl);
+            }
+            edit.append_submenu(Some("New"), &new);
             edit.append(Some("Paste"), Some("win.paste"));
+            if f.is_native() {
+                edit.append(Some("Open terminal here"), Some(&action("win.terminal", &uri)));
+            }
             menu.append_section(None, &edit);
         }
         let side = gio::Menu::new();
@@ -518,6 +562,20 @@ fn no_scroll(w: &gtk::Widget) {
     while let Some(ch) = c {
         no_scroll(&ch);
         c = ch.next_sibling();
+    }
+}
+
+/// Where a symlink points, resolved against its folder (None if not a symlink).
+pub fn symlink_target(info: &gio::FileInfo, f: &gio::File) -> Option<gio::File> {
+    if !info.is_symlink() {
+        return None;
+    }
+    let t = info.symlink_target()?;
+    let t = t.to_string_lossy();
+    if t.starts_with('/') {
+        Some(gio::File::for_path(t.as_ref()))
+    } else {
+        f.parent().map(|p| p.resolve_relative_path(t.as_ref()))
     }
 }
 

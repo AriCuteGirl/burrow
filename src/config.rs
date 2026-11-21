@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub appearance: AppearanceCfg,
     pub view: ViewCfg,
+    pub apps: AppsCfg,
     /// Sidebar sections, top to bottom.
     #[serde(rename = "section")]
     pub sections: Vec<Section>,
@@ -58,6 +59,13 @@ pub struct ViewCfg {
     /// "name", "size", "modified" or "type"
     pub sort: String,
     pub sort_desc: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct AppsCfg {
+    /// Terminal for "Open terminal here" ("kitty", "foot --server"…). Empty = $TERMINAL or auto.
+    pub terminal: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -150,6 +158,7 @@ impl Default for Config {
         Config {
             appearance: AppearanceCfg::default(),
             view: ViewCfg::default(),
+            apps: AppsCfg::default(),
             sections: vec![],
             drives: BTreeMap::new(),
             folders: BTreeMap::new(),

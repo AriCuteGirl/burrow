@@ -488,3 +488,9 @@ stack:focus-visible { outline: none; }
 checkbutton check { background: @bg; border: 1px solid @crimson; border-radius: 4px; color: @on_accent; }
 checkbutton check:checked { background: @accent; border-color: @accent; }
 checkbutton { color: @text_dim; }
+.shortcut-badge {
+  background: @bg_deep;
+  color: @accent_hot;
+  border-radius: 4px;
+  padding: 1px;
+}

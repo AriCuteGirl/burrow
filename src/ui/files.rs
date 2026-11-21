@@ -15,7 +15,7 @@ use std::rc::{Rc, Weak};
 const ATTRS: &str = "standard::name,standard::display-name,standard::icon,standard::type,\
 standard::is-hidden,standard::is-backup,standard::is-symlink,standard::size,standard::content-type,\
 time::modified,thumbnail::path,thumbnail::is-valid,access::can-read,access::can-trash,access::can-delete,\
-trash::orig-path,trash::deletion-date";
+trash::orig-path,trash::deletion-date,standard::symlink-target";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -839,8 +839,15 @@ fn grid_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::SignalL
         lbl.set_justify(gtk::Justification::Center);
         lbl.set_max_width_chars(14);
         lbl.set_width_chars(10);
-        vb.append(&img);
-        vb.append(&pic);
+        // icon (or thumbnail) with a shortcut badge in its corner
+        let icons = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        icons.append(&img);
+        icons.append(&pic);
+        let ov = gtk::Overlay::new();
+        ov.set_child(Some(&icons));
+        ov.add_overlay(&shortcut_badge(16));
+        ov.set_halign(gtk::Align::Center);
+        vb.append(&ov);
         vb.append(&lbl);
         attach_cell(vb.upcast_ref(), li, &pn);
         li.set_child(Some(&vb));
@@ -850,9 +857,8 @@ fn grid_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::SignalL
         let li = o.downcast_ref::<gtk::ListItem>().unwrap();
         let Some(info) = li.item().and_downcast::<gio::FileInfo>() else { return };
         let Some(vb) = li.child().and_downcast::<gtk::Box>() else { return };
-        let img = vb.first_child().and_downcast::<gtk::Image>().unwrap();
-        let pic = img.next_sibling().and_downcast::<gtk::Picture>().unwrap();
-        let lbl = pic.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        let Some((img, pic, badge, lbl)) = grid_parts(&vb) else { return };
+        badge.set_visible(info.is_symlink());
         let name = info.display_name();
         lbl.set_text(&name);
         vb.set_tooltip_text(Some(&name));
@@ -876,9 +882,7 @@ fn grid_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::SignalL
                 if vb.widget_name() != token {
                     return; // cell was recycled for another file
                 }
-                if let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
-                    let img = vb.first_child().unwrap();
-                    let pic = img.next_sibling().and_downcast::<gtk::Picture>().unwrap();
+                if let (Ok(tex), Some((img, pic, _, _))) = (gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)), grid_parts(&vb)) {
                     pic.set_paintable(Some(&tex));
                     pic.set_visible(true);
                     img.set_visible(false);
@@ -887,6 +891,29 @@ fn grid_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::SignalL
         }
     });
     factory
+}
+
+/// Small arrow in the corner of an icon: "this is a shortcut".
+fn shortcut_badge(size: i32) -> gtk::Image {
+    let b = gtk::Image::from_icon_name("emblem-symbolic-link");
+    b.set_pixel_size(size);
+    b.add_css_class("shortcut-badge");
+    b.set_halign(gtk::Align::Start);
+    b.set_valign(gtk::Align::End);
+    b.set_visible(false);
+    b.set_can_target(false);
+    b
+}
+
+/// (icon, thumbnail, badge, label) of a grid cell.
+fn grid_parts(vb: &gtk::Box) -> Option<(gtk::Image, gtk::Picture, gtk::Image, gtk::Label)> {
+    let ov = vb.first_child().and_downcast::<gtk::Overlay>()?;
+    let icons = ov.child().and_downcast::<gtk::Box>()?;
+    let img = icons.first_child().and_downcast::<gtk::Image>()?;
+    let pic = img.next_sibling().and_downcast::<gtk::Picture>()?;
+    let badge = ov.last_child().and_downcast::<gtk::Image>()?;
+    let lbl = ov.next_sibling().and_downcast::<gtk::Label>()?;
+    Some((img, pic, badge, lbl))
 }
 
 fn compact_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::SignalListItemFactory {
@@ -904,7 +931,10 @@ fn compact_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::Sign
         lbl.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         lbl.set_width_chars(18);
         lbl.set_max_width_chars(24);
-        hb.append(&img);
+        let ov = gtk::Overlay::new();
+        ov.set_child(Some(&img));
+        ov.add_overlay(&shortcut_badge(10));
+        hb.append(&ov);
         hb.append(&lbl);
         attach_cell(hb.upcast_ref(), li, &pn);
         li.set_child(Some(&hb));
@@ -914,8 +944,12 @@ fn compact_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::Sign
         let li = o.downcast_ref::<gtk::ListItem>().unwrap();
         let Some(info) = li.item().and_downcast::<gio::FileInfo>() else { return };
         let Some(hb) = li.child().and_downcast::<gtk::Box>() else { return };
-        let img = hb.first_child().and_downcast::<gtk::Image>().unwrap();
-        let lbl = img.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        let Some(ov) = hb.first_child().and_downcast::<gtk::Overlay>() else { return };
+        let Some(img) = ov.child().and_downcast::<gtk::Image>() else { return };
+        let Some(lbl) = ov.next_sibling().and_downcast::<gtk::Label>() else { return };
+        if let Some(b) = ov.last_child().and_downcast::<gtk::Image>() {
+            b.set_visible(info.is_symlink());
+        }
         img.set_from_gicon(&item_icon(&info, &lk));
         lbl.set_text(&info.display_name());
         hb.set_tooltip_text(Some(&info.display_name()));

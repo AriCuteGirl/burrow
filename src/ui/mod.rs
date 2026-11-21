@@ -1,6 +1,8 @@
 //! UI: one `Win` per window, holding tabs; each tab holds one pane or two (split view).
 //! All file system work goes through async GIO calls or gio::spawn_blocking.
 
+mod apps;
+mod create;
 mod dialogs;
 mod dirmodel;
 mod drives_page;
@@ -101,6 +103,8 @@ enum UndoOp {
     Transfer(Vec<crate::transfer::Done>),
     Rename { file: gio::File, old_name: String },
     NewFolder(gio::File),
+    /// A file or shortcut we created: undo moves it to the trash.
+    Created(gio::File),
 }
 
 thread_local! {
@@ -1186,6 +1190,24 @@ impl Win {
             w.window.clipboard().set_text(&f.parse_name());
             w.show_notice("Path copied", false);
         }));
+        add_s("new-file", Box::new(|w, kind| {
+            if let Some(k) = create::NewKind::parse(&kind) {
+                w.new_file(k);
+            }
+        }));
+        add_s("new-template", Box::new(|w, uri| w.new_from_template(gio::File::for_uri(&uri))));
+        add_s("shortcut", Box::new(|w, uri| w.create_shortcut(gio::File::for_uri(&uri))));
+        add_s("terminal", Box::new(|w, uri| w.open_terminal(gio::File::for_uri(&uri))));
+        add_s("open-with", Box::new(|w, app| {
+            let files = w.active().selected_files();
+            w.open_with(&app, files);
+        }));
+        add_s("choose-app", Box::new(|w, ctype| {
+            let files = w.active().selected_files();
+            if !files.is_empty() {
+                w.choose_app(files, ctype);
+            }
+        }));
         add_s("paste-into", Box::new(|w, uri| w.paste_into(gio::File::for_uri(&uri))));
         add_s("view-mode", Box::new(|w, m| w.active().set_mode(Mode::parse(&m))));
         add_s("folder-icon", Box::new(|w, uri| {
@@ -1419,6 +1441,17 @@ impl Win {
                         match r {
                             Ok(_) => w.show_notice(&format!("Undo: renamed back to {old_name}"), false),
                             Err(e) => w.show_notice(&format!("Couldn't undo the rename: {}", e.message()), true),
+                        }
+                    }
+                });
+            }
+            UndoOp::Created(f) => {
+                let weak = Rc::downgrade(self);
+                f.trash_async(glib::Priority::DEFAULT, gio::Cancellable::NONE, move |r| {
+                    if let Some(w) = weak.upgrade() {
+                        match r {
+                            Ok(()) => w.show_notice("Undo: moved it to the Trash", false),
+                            Err(e) => w.show_notice(&format!("Couldn't undo: {}", e.message()), true),
                         }
                     }
                 });
@@ -1658,7 +1691,7 @@ impl Win {
 }
 
 /// Reject names the file system or the user would regret.
-fn check_name(name: &str) -> Option<&'static str> {
+pub(crate) fn check_name(name: &str) -> Option<&'static str> {
     if name.is_empty() || name == "." || name == ".." {
         Some("That name can't be used")
     } else if name.contains('/') || name.contains('\0') {
