@@ -481,3 +481,8 @@ menubutton.jobs-button > button {
 }
 .jobs-list { padding: 4px; }
 .job-row { padding: 6px 4px; }
+gridview.files > child .drop-hover, columnview.files .drop-hover {
+  background: @sel_bg;
+  border-radius: $R_SMALL;
+  box-shadow: inset 0 0 0 2px @accent_hot;
+}

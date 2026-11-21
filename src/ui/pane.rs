@@ -389,6 +389,18 @@ impl Pane {
             }
             menu.append_section(None, &side);
         }
+        let edit = gio::Menu::new();
+        if !self.in_trash() {
+            edit.append(Some("Cut"), Some("win.cut"));
+        }
+        edit.append(Some("Copy"), Some("win.copy"));
+        if is_dir && sel.len() == 1 && !self.in_trash() {
+            edit.append(Some("Paste into folder"), Some(&action("win.paste-into", &uri)));
+        }
+        if sel.len() == 1 && !self.in_trash() {
+            edit.append(Some("Rename…"), Some("win.rename"));
+        }
+        menu.append_section(None, &edit);
         let misc = gio::Menu::new();
         misc.append(Some("Copy path"), Some(&action("win.copy-path", &uri)));
         menu.append_section(None, &misc);
@@ -414,6 +426,13 @@ impl Pane {
         view.append(Some("Compact"), Some("win.view-mode::compact"));
         view.append(Some("List"), Some("win.view-mode::list"));
         menu.append_section(Some("View"), &view);
+        if !self.in_trash() {
+            let edit = gio::Menu::new();
+            edit.append(Some("New folder…"), Some("win.new-folder"));
+            edit.append(Some("Paste"), Some("win.paste"));
+            edit.append(Some("Select all"), Some("win.select-all"));
+            menu.append_section(None, &edit);
+        }
         let side = gio::Menu::new();
         let pin = gio::Menu::new();
         for s in w.cfg.borrow().sections.iter() {

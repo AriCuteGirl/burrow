@@ -97,6 +97,9 @@ pub struct Win {
 enum UndoOp {
     /// Paths that went to the trash, and when (unix seconds).
     Trash { paths: Vec<String>, since: i64 },
+    Transfer(Vec<crate::transfer::Done>),
+    Rename { file: gio::File, old_name: String },
+    NewFolder(gio::File),
 }
 
 thread_local! {
@@ -1117,6 +1120,20 @@ impl Win {
         add("restore", &[], Box::new(|w| w.restore_selection()));
         add("empty-trash", &[], Box::new(|w| w.empty_trash()));
         add("undo", &["<Ctrl>z"], Box::new(|w| w.undo()));
+        // Ctrl+C/X/V/A and F2 are handled by the file views' key controller, so text
+        // fields keep their own copy/paste.
+        add("copy", &[], Box::new(|w| w.clipboard_set(w.active().selected_files(), false)));
+        add("cut", &[], Box::new(|w| w.clipboard_set(w.active().selected_files(), true)));
+        add("paste", &[], Box::new(|w| {
+            if let Some(d) = w.active().current_file() {
+                w.paste_into(d);
+            }
+        }));
+        add("new-folder", &["<Ctrl><Shift>n"], Box::new(|w| w.new_folder()));
+        add("rename", &[], Box::new(|w| w.rename_selection()));
+        add("select-all", &[], Box::new(|w| {
+            w.active().files.selection.select_all();
+        }));
         for i in 1..=8u32 {
             let a = gio::SimpleAction::new(&format!("tab-{i}"), None);
             let weak = Rc::downgrade(self);
@@ -1168,6 +1185,7 @@ impl Win {
             w.window.clipboard().set_text(&f.parse_name());
             w.show_notice("Path copied", false);
         }));
+        add_s("paste-into", Box::new(|w, uri| w.paste_into(gio::File::for_uri(&uri))));
         add_s("view-mode", Box::new(|w, m| w.active().set_mode(Mode::parse(&m))));
         add_s("folder-icon", Box::new(|w, uri| {
             let key = files::folder_key(&gio::File::for_uri(&uri));
@@ -1385,6 +1403,37 @@ impl Win {
             return;
         };
         match op {
+            UndoOp::Transfer(items) => {
+                let n = items.len();
+                jobs::run(self, &format!("Undo: {n} item{}", if n == 1 { "" } else { "s" }), move |p, c| crate::transfer::undo(&items, p, c), |w, k, p, cancelled| {
+                    let (msg, err) = jobs::summary(&format!("Undone ({k} item{})", if k == 1 { "" } else { "s" }), p, cancelled);
+                    w.show_notice(&msg, err);
+                });
+            }
+            UndoOp::Rename { file, old_name } => {
+                let weak = Rc::downgrade(self);
+                let target = old_name.clone();
+                file.set_display_name_async(&target, glib::Priority::DEFAULT, gio::Cancellable::NONE, move |r| {
+                    if let Some(w) = weak.upgrade() {
+                        match r {
+                            Ok(_) => w.show_notice(&format!("Undo: renamed back to {old_name}"), false),
+                            Err(e) => w.show_notice(&format!("Couldn't undo the rename: {}", e.message()), true),
+                        }
+                    }
+                });
+            }
+            UndoOp::NewFolder(f) => {
+                let weak = Rc::downgrade(self);
+                // only removes it while still empty
+                f.delete_async(glib::Priority::DEFAULT, gio::Cancellable::NONE, move |r| {
+                    if let Some(w) = weak.upgrade() {
+                        match r {
+                            Ok(()) => w.show_notice("Undo: folder removed", false),
+                            Err(_) => w.show_notice("Not undone: the new folder isn't empty any more", true),
+                        }
+                    }
+                });
+            }
             UndoOp::Trash { paths, since } => {
                 let n = paths.len();
                 jobs::run(
@@ -1442,6 +1491,181 @@ impl Win {
                 }
             },
         );
+    }
+}
+
+impl Win {
+    // ------------------------------------------------------------------ copy / move / paste
+    /// Copy or move into `dest`. Auto = move on the same drive, copy across drives.
+    pub fn transfer(self: &Rc<Self>, sources: Vec<gio::File>, dest: gio::File, mode: crate::transfer::Mode) {
+        use crate::transfer::Mode;
+        // dropping something onto itself does nothing
+        let sources: Vec<gio::File> = sources.into_iter().filter(|s| !s.equal(&dest)).collect();
+        if sources.is_empty() {
+            return;
+        }
+        let n = sources.len();
+        let what = if n == 1 { format!("“{}”", display_name(&sources[0], &self.home)) } else { format!("{n} items") };
+        let verb = match mode {
+            Mode::Copy => "Copying",
+            Mode::Move => "Moving",
+            Mode::Auto => "Moving",
+        };
+        let dname = display_name(&dest, &self.home);
+        let title = format!("{verb} {what} to {dname}");
+        jobs::run(self, &title, move |p, c| crate::transfer::transfer(&sources, &dest, mode, p, c), move |w, done, p, cancelled| {
+            let k = done.len();
+            let moved = done.iter().filter(|d| d.moved).count();
+            let verb = if moved == k && k > 0 { "Moved" } else if moved == 0 { "Copied" } else { "Copied/moved" };
+            if k > 0 {
+                w.undo.borrow_mut().push(UndoOp::Transfer(done));
+            }
+            let text = format!("{verb} {k} item{} to {dname}{}", if k == 1 { "" } else { "s" }, if k > 0 { " · Ctrl+Z to undo" } else { "" });
+            let (msg, err) = jobs::summary(&text, p, cancelled);
+            w.show_notice(&msg, err);
+            w.sidebar.refresh_usage();
+        });
+    }
+
+    /// Put files on the clipboard in the formats other file managers use too.
+    pub fn clipboard_set(self: &Rc<Self>, files: Vec<gio::File>, cut: bool) {
+        if files.is_empty() {
+            return;
+        }
+        let uris: Vec<String> = files.iter().map(|f| f.uri().to_string()).collect();
+        let gnome = format!("{}\n{}", if cut { "cut" } else { "copy" }, uris.join("\n"));
+        let urilist = format!("{}\r\n", uris.join("\r\n"));
+        let list = gdk::FileList::from_array(&files);
+        let providers = [
+            gdk::ContentProvider::for_bytes("x-special/gnome-copied-files", &glib::Bytes::from_owned(gnome.into_bytes())),
+            gdk::ContentProvider::for_bytes("application/x-kde-cutselection", &glib::Bytes::from_owned(if cut { b"1".to_vec() } else { b"0".to_vec() })),
+            gdk::ContentProvider::for_value(&list.to_value()),
+            gdk::ContentProvider::for_bytes("text/uri-list", &glib::Bytes::from_owned(urilist.into_bytes())),
+        ];
+        let union = gdk::ContentProvider::new_union(&providers);
+        let _ = self.window.clipboard().set_content(Some(&union));
+        let n = files.len();
+        self.show_notice(&format!("{} {n} item{} · paste with Ctrl+V", if cut { "Cut" } else { "Copied" }, if n == 1 { "" } else { "s" }), false);
+    }
+
+    /// Paste the clipboard into `dest` (copy, or move if it was cut).
+    pub fn paste_into(self: &Rc<Self>, dest: gio::File) {
+        let cb = self.window.clipboard();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            // GNOME/Nemo/Thunar format first: it says copy or cut
+            let mut parsed: Option<(bool, Vec<gio::File>)> = None;
+            if let Ok((stream, _)) = cb.read_future(&["x-special/gnome-copied-files"], glib::Priority::DEFAULT).await {
+                let out = gio::MemoryOutputStream::new_resizable();
+                if out.splice_future(&stream, gio::OutputStreamSpliceFlags::CLOSE_SOURCE | gio::OutputStreamSpliceFlags::CLOSE_TARGET, glib::Priority::DEFAULT).await.is_ok() {
+                    let text = String::from_utf8_lossy(&out.steal_as_bytes()).to_string();
+                    let mut lines = text.lines();
+                    let cut = lines.next().map(str::trim) == Some("cut");
+                    let files: Vec<gio::File> = lines.map(str::trim).filter(|l| !l.is_empty()).map(gio::File::for_uri).collect();
+                    if !files.is_empty() {
+                        parsed = Some((cut, files));
+                    }
+                }
+            }
+            if parsed.is_none() {
+                if let Ok(v) = cb.read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT).await {
+                    if let Ok(list) = v.get::<gdk::FileList>() {
+                        parsed = Some((false, list.files()));
+                    }
+                }
+            }
+            let Some(w) = weak.upgrade() else { return };
+            match parsed {
+                Some((cut, files)) => {
+                    w.transfer(files, dest, if cut { crate::transfer::Mode::Move } else { crate::transfer::Mode::Copy });
+                    if cut {
+                        // a cut is pasted once
+                        let _ = w.window.clipboard().set_content(None::<&gdk::ContentProvider>);
+                    }
+                }
+                None => w.show_notice("Nothing to paste", false),
+            }
+        });
+    }
+
+    fn new_folder(self: &Rc<Self>) {
+        let Some(dir) = self.active().current_file() else { return };
+        let weak = Rc::downgrade(self);
+        dialogs::prompt_text(&self.window, "New folder", "", "New Folder", move |name| {
+            let Some(w) = weak.upgrade() else { return };
+            if let Some(err) = check_name(&name) {
+                w.show_notice(err, true);
+                return;
+            }
+            let f = dir.child(&name);
+            let weak = Rc::downgrade(&w);
+            f.clone().make_directory_async(glib::Priority::DEFAULT, gio::Cancellable::NONE, move |r| {
+                let Some(w) = weak.upgrade() else { return };
+                match r {
+                    Ok(()) => {
+                        w.undo.borrow_mut().push(UndoOp::NewFolder(f));
+                        w.show_notice(&format!("Created {name}"), false);
+                    }
+                    Err(e) if e.matches(gio::IOErrorEnum::Exists) => w.show_notice(&format!("“{name}” already exists here"), true),
+                    Err(e) => w.show_notice(&format!("Couldn't create the folder: {}", e.message()), true),
+                }
+            });
+        });
+    }
+
+    fn rename_selection(self: &Rc<Self>) {
+        let sel = self.active().files.selected_infos();
+        if sel.len() != 1 {
+            if sel.len() > 1 {
+                self.show_notice("Select one item to rename (batch rename is coming)", false);
+            }
+            return;
+        }
+        let info = sel[0].clone();
+        let Some(file) = files::info_file(&info) else { return };
+        let old = info.display_name().to_string();
+        let weak = Rc::downgrade(self);
+        let initial = old.clone();
+        dialogs::prompt_text(&self.window, "Rename", "", &initial, move |name| {
+            let Some(w) = weak.upgrade() else { return };
+            if name == old {
+                return;
+            }
+            if let Some(err) = check_name(&name) {
+                w.show_notice(err, true);
+                return;
+            }
+            if file.parent().is_some_and(|p| p.child(&name).query_exists(gio::Cancellable::NONE)) {
+                w.show_notice(&format!("“{name}” already exists here"), true);
+                return;
+            }
+            let weak = Rc::downgrade(&w);
+            let old = old.clone();
+            let new_name = name.clone();
+            file.set_display_name_async(&new_name, glib::Priority::DEFAULT, gio::Cancellable::NONE, move |r| {
+                let Some(w) = weak.upgrade() else { return };
+                match r {
+                    Ok(newf) => {
+                        w.undo.borrow_mut().push(UndoOp::Rename { file: newf, old_name: old });
+                        w.show_notice(&format!("Renamed to {name} · Ctrl+Z to undo"), false);
+                    }
+                    Err(e) => w.show_notice(&format!("Couldn't rename: {}", e.message()), true),
+                }
+            });
+        });
+    }
+}
+
+/// Reject names the file system or the user would regret.
+fn check_name(name: &str) -> Option<&'static str> {
+    if name.is_empty() || name == "." || name == ".." {
+        Some("That name can't be used")
+    } else if name.contains('/') || name.contains('\0') {
+        Some("Names can't contain “/”")
+    } else if name.len() > 255 {
+        Some("That name is too long")
+    } else {
+        None
     }
 }
 

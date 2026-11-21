@@ -260,6 +260,102 @@ pub fn confirm(parent: &impl IsA<gtk::Window>, title: &str, text: &str, danger: 
     cancel.grab_focus();
 }
 
+/// "f.txt already exists": Skip / Keep both / Replace (or Merge for folders), optionally for all.
+pub fn conflict(parent: &impl IsA<gtk::Window>, c: &crate::transfer::Conflict, cb: impl FnOnce(crate::transfer::Choice, bool) + 'static) {
+    use crate::transfer::Choice;
+    let kind = if c.dest_is_dir { "A folder" } else { "A file" };
+    let (win, root) = dialog_window(parent.upcast_ref(), &format!("“{}” already exists", c.name), 480);
+    let where_ = gtk::Label::new(Some(&format!("{kind} with this name is already in {}.", c.dest_dir)));
+    where_.add_css_class("dialog-hint");
+    where_.set_xalign(0.0);
+    where_.set_wrap(true);
+    root.append(&where_);
+    let when = |t: i64| {
+        glib::DateTime::from_unix_local(t).ok().and_then(|d| d.format("%-d %b %Y %H:%M").ok()).map(|s| s.to_string()).unwrap_or_default()
+    };
+    let info = |label: &str, dir: bool, size: u64, mtime: i64| {
+        let what = if dir { "folder".to_string() } else { crate::util::human_size(size) };
+        let l = gtk::Label::new(Some(&format!("{label}: {what} · modified {}", when(mtime))));
+        l.add_css_class("settings-sub");
+        l.set_xalign(0.0);
+        l
+    };
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    card.add_css_class("settings-group");
+    card.set_margin_top(2);
+    let inner = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    inner.set_margin_top(8);
+    inner.set_margin_bottom(8);
+    inner.set_margin_start(12);
+    inner.set_margin_end(12);
+    inner.append(&info("Already there", c.dest_is_dir, c.dest_size, c.dest_mtime));
+    inner.append(&info("Incoming", c.src_is_dir, c.src_size, c.src_mtime));
+    card.append(&inner);
+    root.append(&card);
+    let all = gtk::CheckButton::with_label("Do this for every clash in this job");
+    root.append(&all);
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.set_margin_top(4);
+    let cancel = gtk::Button::with_label("Stop job");
+    cancel.add_css_class("secondary");
+    row.append(&cancel);
+    let sp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    sp.set_hexpand(true);
+    row.append(&sp);
+    let skip = gtk::Button::with_label("Skip");
+    skip.add_css_class("secondary");
+    let both = gtk::Button::with_label("Keep both");
+    both.add_css_class("secondary");
+    row.append(&skip);
+    row.append(&both);
+    let third = if c.src_is_dir && c.dest_is_dir {
+        let b = gtk::Button::with_label("Merge");
+        b.add_css_class("primary");
+        Some((b, Choice::Merge))
+    } else if c.src_is_dir == c.dest_is_dir {
+        let b = gtk::Button::with_label("Replace");
+        b.add_css_class("danger");
+        Some((b, Choice::Replace))
+    } else {
+        None // file vs folder: never replace one with the other
+    };
+    if let Some((b, _)) = &third {
+        row.append(b);
+    }
+    root.append(&row);
+
+    let cb: Rc<RefCell<Option<Box<dyn FnOnce(Choice, bool)>>>> = Rc::new(RefCell::new(Some(Box::new(cb))));
+    let answer = {
+        let (cb, ww, all) = (cb.clone(), win.downgrade(), all.clone());
+        move |ch: Choice| {
+            if let Some(f) = cb.borrow_mut().take() {
+                f(ch, all.is_active());
+            }
+            if let Some(w) = ww.upgrade() {
+                w.close();
+            }
+        }
+    };
+    for (b, ch) in [(&skip, Choice::Skip), (&both, Choice::KeepBoth), (&cancel, Choice::Cancel)] {
+        let a = answer.clone();
+        b.connect_clicked(move |_| a(ch));
+    }
+    if let Some((b, ch)) = third {
+        let a = answer.clone();
+        b.connect_clicked(move |_| a(ch));
+    }
+    // closing the dialog any other way (Esc) = Skip, the safe answer
+    win.connect_close_request(move |_| {
+        if let Some(f) = cb.borrow_mut().take() {
+            f(Choice::Skip, false);
+        }
+        glib::Propagation::Proceed
+    });
+    win.present();
+    skip.grab_focus();
+}
+
 /// Pick a colour; `cb` gets "#rrggbb".
 pub fn pick_color(parent: &impl IsA<gtk::Window>, initial: Option<&str>, cb: impl Fn(String) + 'static) {
     let d = gtk::ColorDialog::builder().title("Section colour").modal(true).with_alpha(false).build();

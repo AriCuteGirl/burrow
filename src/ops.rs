@@ -5,8 +5,8 @@
 use gtk::gio;
 use gtk::gio::prelude::*;
 use gtk::glib;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 #[derive(Default)]
@@ -16,6 +16,13 @@ pub struct Progress {
     pub current: Mutex<String>,
     pub paused: AtomicBool,
     pub errors: Mutex<Vec<String>>,
+    /// Byte progress for copies (0 total = count-based only).
+    pub bytes_done: AtomicU64,
+    pub bytes_total: AtomicU64,
+    /// A name clash the worker is waiting on; the UI answers through `answer` + `answered`.
+    pub ask: Mutex<Option<crate::transfer::Conflict>>,
+    pub answer: Mutex<Option<(crate::transfer::Choice, bool)>>,
+    pub answered: Condvar,
 }
 
 impl Progress {

@@ -375,6 +375,11 @@ impl Sidebar {
         let weak = Rc::downgrade(w);
         let rw = r.downgrade();
         let is_trash = matches!(tgt, Target::Folder { file, .. } if file.uri_scheme().as_deref() == Some("trash"));
+        let dest = match tgt {
+            Target::Folder { file, .. } if file.uri_scheme().as_deref() != Some("trash") => Some(file.clone()),
+            Target::Drive { root: Some(r), .. } => Some(r.clone()),
+            _ => None,
+        };
         drop.connect_drop(move |_, v, _, y| {
             let (Some(w), Some(r)) = (weak.upgrade(), rw.upgrade()) else { return false };
             r.remove_css_class("drop-before");
@@ -383,6 +388,15 @@ impl Sidebar {
             if is_trash {
                 if let Ok(list) = v.get::<gdk::FileList>() {
                     w.trash_files(list.files());
+                    return true;
+                }
+            }
+            // files dropped onto the middle of a folder/drive row go into it;
+            // the top and bottom edges pin the folder at that spot instead
+            if let (Ok(list), Some(dest)) = (v.get::<gdk::FileList>(), dest.clone()) {
+                let f = y / r.height().max(1) as f64;
+                if (0.25..=0.75).contains(&f) {
+                    w.transfer(list.files(), dest, crate::transfer::Mode::Auto);
                     return true;
                 }
             }

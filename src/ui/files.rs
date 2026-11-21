@@ -343,6 +343,17 @@ impl Files {
             });
         }
 
+        // files dropped on empty space land in this folder
+        let drop = file_drop_target();
+        let weak = Rc::downgrade(pane);
+        drop.connect_drop(move |d, v, _, _| {
+            let (Some(p), Ok(list)) = (weak.upgrade(), v.get::<gdk::FileList>()) else { return false };
+            let Some(dest) = p.current_file() else { return false };
+            drop_into(&p, list.files(), dest, d.current_event_state());
+            true
+        });
+        self.widget.add_controller(drop);
+
         for view in [self.grid.clone().upcast::<gtk::Widget>(), self.compact.clone().upcast(), self.list.clone().upcast()] {
             // Backspace = parent, typing = filter-as-you-type
             let keys = gtk::EventControllerKey::new();
@@ -351,6 +362,29 @@ impl Files {
                 let Some(p) = weak.upgrade() else { return glib::Propagation::Proceed };
                 if key == gdk::Key::BackSpace && mods.is_empty() {
                     p.go_up();
+                    return glib::Propagation::Stop;
+                }
+                let ctrl_only = mods & (gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::ALT_MASK) == gdk::ModifierType::CONTROL_MASK;
+                let act = |name: &str| {
+                    if let Some(w) = p.win() {
+                        gio::prelude::ActionGroupExt::activate_action(&w.window, name, None);
+                    }
+                };
+                if ctrl_only {
+                    let name = match key.to_lower() {
+                        gdk::Key::c => Some("copy"),
+                        gdk::Key::x => Some("cut"),
+                        gdk::Key::v => Some("paste"),
+                        gdk::Key::a => Some("select-all"),
+                        _ => None,
+                    };
+                    if let Some(n) = name {
+                        act(n);
+                        return glib::Propagation::Stop;
+                    }
+                }
+                if key == gdk::Key::F2 && mods.is_empty() {
+                    act("rename");
                     return glib::Propagation::Stop;
                 }
                 if key == gdk::Key::Delete || key == gdk::Key::KP_Delete {
@@ -699,6 +733,63 @@ fn attach_cell(w: &gtk::Widget, li: &gtk::ListItem, pane: &Rc<RefCell<Weak<Pane>
         }
     });
     w.add_controller(drag);
+
+    // Drop onto a folder = into that folder; onto a file = into the current folder.
+    let drop = file_drop_target();
+    let (liw, ww) = (li.downgrade(), w.downgrade());
+    drop.connect_enter(move |_, _, _| {
+        let is_dir = liw.upgrade().and_then(|li| li.item()).and_downcast::<gio::FileInfo>().is_some_and(|i| i.file_type() == gio::FileType::Directory);
+        if let (true, Some(w)) = (is_dir, ww.upgrade()) {
+            w.add_css_class("drop-hover");
+        }
+        gdk::DragAction::COPY | gdk::DragAction::MOVE
+    });
+    let ww = w.downgrade();
+    drop.connect_leave(move |_| {
+        if let Some(w) = ww.upgrade() {
+            w.remove_css_class("drop-hover");
+        }
+    });
+    let (liw, pw, ww) = (li.downgrade(), pane.clone(), w.downgrade());
+    drop.connect_drop(move |d, v, _, _| {
+        if let Some(w) = ww.upgrade() {
+            w.remove_css_class("drop-hover");
+        }
+        let (Some(li), Some(p), Ok(list)) = (liw.upgrade(), pw.borrow().upgrade(), v.get::<gdk::FileList>()) else { return false };
+        let info = li.item().and_downcast::<gio::FileInfo>();
+        let dest = match info {
+            Some(i) if i.file_type() == gio::FileType::Directory => info_file(&i),
+            _ => p.current_file(),
+        };
+        let Some(dest) = dest else { return false };
+        drop_into(&p, list.files(), dest, d.current_event_state());
+        true
+    });
+    w.add_controller(drop);
+}
+
+fn file_drop_target() -> gtk::DropTarget {
+    let d = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY | gdk::DragAction::MOVE);
+    d.set_preload(true);
+    d
+}
+
+/// Ctrl = copy, Shift = move, plain drop = move on the same drive / copy across drives.
+pub fn drop_mode(mods: gdk::ModifierType) -> crate::transfer::Mode {
+    use crate::transfer::Mode;
+    if mods.contains(gdk::ModifierType::CONTROL_MASK) {
+        Mode::Copy
+    } else if mods.contains(gdk::ModifierType::SHIFT_MASK) {
+        Mode::Move
+    } else {
+        Mode::Auto
+    }
+}
+
+fn drop_into(p: &Rc<Pane>, files: Vec<gio::File>, dest: gio::File, mods: gdk::ModifierType) {
+    if let Some(w) = p.win() {
+        w.transfer(files, dest, drop_mode(mods));
+    }
 }
 
 fn grid_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::SignalListItemFactory {

@@ -112,18 +112,46 @@ where
         }
     });
 
-    // UI poll
+    // UI poll: progress text, and name-clash questions from the worker
     let (p, barw, subw, fin) = (progress.clone(), bar.downgrade(), sub.downgrade(), finished.clone());
+    let asking = Rc::new(Cell::new(false));
+    let weak = Rc::downgrade(w);
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let (Some(bar), Some(sub)) = (barw.upgrade(), subw.upgrade()) else { return glib::ControlFlow::Break };
         if fin.get() {
             return glib::ControlFlow::Break;
         }
+        if !asking.get() {
+            let q = p.ask.lock().ok().and_then(|q| q.clone());
+            if let (Some(conflict), Some(w)) = (q, weak.upgrade()) {
+                asking.set(true);
+                let (p2, asking2) = (p.clone(), asking.clone());
+                super::dialogs::conflict(&w.window, &conflict, move |choice, all| {
+                    if let Ok(mut a) = p2.answer.lock() {
+                        *a = Some((choice, all));
+                    }
+                    if let Ok(mut q) = p2.ask.lock() {
+                        *q = None;
+                    }
+                    p2.answered.notify_all();
+                    asking2.set(false);
+                });
+            }
+        }
         let (d, t) = (p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed));
-        if t > 0 {
+        let (bd, bt) = (p.bytes_done.load(Ordering::Relaxed), p.bytes_total.load(Ordering::Relaxed));
+        let paused = if p.paused.load(Ordering::Relaxed) { "Paused · " } else { "" };
+        if bt > 0 {
+            bar.set_fraction((bd as f64 / bt as f64).min(1.0));
+            let cur = p.current.lock().map(|c| c.clone()).unwrap_or_default();
+            sub.set_text(&format!(
+                "{paused}{} of {} · {cur}",
+                crate::util::human_size(bd.min(bt)),
+                crate::util::human_size(bt)
+            ));
+        } else if t > 0 {
             bar.set_fraction((d as f64 / t as f64).min(1.0));
             let cur = p.current.lock().map(|c| c.clone()).unwrap_or_default();
-            let paused = if p.paused.load(Ordering::Relaxed) { "Paused · " } else { "" };
             sub.set_text(&format!("{paused}{} of {t} · {cur}", d.min(t)));
         } else {
             bar.pulse();
