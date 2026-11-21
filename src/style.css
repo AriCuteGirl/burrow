@@ -294,3 +294,150 @@ scrollbar slider { background: alpha(@text, 0.25); border-radius: 99px; min-widt
 scrollbar slider:hover { background: @crimson; }
 
 paned > separator { background: @wine; min-width: 1px; }
+
+/* ---------------- top bar / tabs ---------------- */
+.topbar {
+  padding: 8px 12px 0 12px;
+  background: transparent;
+}
+.tabbar { padding-bottom: 6px; }
+.tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: $R_SMALL;
+  padding: 4px 6px 4px 10px;
+  color: @text_faint;
+  min-height: 26px;
+}
+.tab:hover { background: @hover_bg; color: @text_dim; }
+.tab.active {
+  background: @surface;
+  border-color: @crimson;
+  color: @text;
+  box-shadow: $SHADOW;
+}
+.tab label { font-size: 12px; font-weight: 600; }
+button.tab-close {
+  min-width: 18px;
+  min-height: 18px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  color: @text_faint;
+  border-radius: $R_SMALL;
+}
+button.tab-close:hover { background: @surface_alt; color: @text; }
+.topbar > button, .topbar > togglebutton, .topbar > menubutton > button,
+.segmented > togglebutton {
+  margin-bottom: 6px;
+}
+.segmented {
+  background: @surface;
+  border: 1px solid @wine;
+  border-radius: $R_SMALL;
+  padding: 1px;
+}
+.segmented > togglebutton { margin: 0; border-radius: $R_SMALL; }
+togglebutton.flat-btn, menubutton.flat-btn > button {
+  background: transparent;
+  border: 1px solid transparent;
+  box-shadow: none;
+  color: @text_dim;
+  min-width: 32px;
+  min-height: 30px;
+  padding: 0;
+  border-radius: $R_SMALL;
+}
+togglebutton.flat-btn:hover, menubutton.flat-btn > button:hover { background: @surface_alt; color: @text; }
+togglebutton.flat-btn:checked { background: @sel_bg; color: @text; border-color: @crimson; }
+togglebutton.flat-btn:disabled { opacity: 0.35; }
+
+/* ---------------- panes ---------------- */
+.pane { border-top: 2px solid transparent; }
+.pane.active-pane { border-top-color: @accent_hot; }
+.pane .toolbar { padding: 6px 12px 8px 12px; }
+
+/* ---------------- compact + list views ---------------- */
+gridview.files.compact > child { padding: 4px 8px; margin: 1px; }
+columnview.files { background: transparent; color: @text_dim; }
+columnview.files > header {
+  background: transparent;
+  border-bottom: 1px solid @wine;
+}
+columnview.files > header > button {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  color: @text_faint;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 6px 10px;
+}
+columnview.files > header > button:hover { color: @text; }
+columnview.files > header > button sort-indicator { color: @accent_hot; }
+columnview.files > listview { background: transparent; }
+columnview.files > listview > row {
+  background: transparent;
+  border-radius: $R_SMALL;
+  border: 1px solid transparent;
+  padding: 2px 0;
+}
+columnview.files > listview > row:hover { background: @hover_bg; color: @text; }
+columnview.files > listview > row:selected { background: @sel_bg; border-color: @crimson; color: @text; }
+columnview.files > listview > row > cell { padding: 3px 10px; }
+.file-meta { font-size: 12px; color: @text_faint; }
+columnview.files > listview > row:selected .file-meta { color: @text_dim; }
+rubberband { background: alpha(@accent, 0.18); border: 1px solid @crimson; }
+
+/* ---------------- sidebar drag and drop ---------------- */
+.side-list row.drop-before { box-shadow: inset 0 2px 0 0 @accent_hot; }
+.side-list row.drop-after { box-shadow: inset 0 -2px 0 0 @accent_hot; }
+.section-header.drop-into { background: @sel_bg; box-shadow: inset 0 0 0 1px @crimson; }
+
+/* ---------------- dialogs + settings ---------------- */
+window.dialog { background: transparent; }
+.dialog-root {
+  background: @bg;
+  border: 1px solid @crimson;
+  border-radius: $R_BIG;
+  padding: 18px;
+  box-shadow: $SHADOW;
+  margin: 0 8px 8px 0;
+}
+.dialog-title { font-size: 18px; font-weight: 800; color: @text; }
+.dialog-hint { font-size: 12px; color: @text_faint; }
+.settings-group {
+  background: @surface;
+  border: 1px solid @wine;
+  border-radius: $R;
+  padding: 2px 0;
+}
+.settings-row { padding: 10px 14px; border-bottom: 1px solid alpha(@wine, 0.6); }
+.settings-row:last-child { border-bottom: none; }
+.settings-title { font-size: 13px; font-weight: 600; color: @text; }
+.settings-sub { font-size: 11px; color: @text_faint; }
+dropdown > button, spinbutton, fontdialogbutton > button, button.font {
+  background: @bg;
+  color: @text;
+  border: 1px solid @wine;
+  border-radius: $R_SMALL;
+  box-shadow: none;
+  min-height: 30px;
+}
+dropdown > button:hover, fontdialogbutton > button:hover { border-color: @crimson; }
+spinbutton > text { color: @text; background: transparent; }
+spinbutton > button { background: transparent; border: none; color: @text_dim; box-shadow: none; }
+switch {
+  background: alpha(@text, 0.15);
+  border: 1px solid @wine;
+  border-radius: 99px;
+}
+switch:checked { background: @accent; border-color: @accent; }
+switch > slider { background: @text; border-radius: 99px; border: none; box-shadow: none; min-width: 18px; min-height: 18px; }
+scale trough { background: alpha(@text, 0.12); border-radius: 99px; min-height: 4px; border: none; }
+scale highlight { background: @accent; border-radius: 99px; }
+scale slider { background: @text; border-radius: 99px; min-width: 14px; min-height: 14px; border: none; box-shadow: none; }
+scale value { color: @text_faint; font-size: 11px; }
+popover listview row:hover, popover.menu row:hover { background: @surface_alt; }
+popover listview row:selected { background: @sel_bg; }

@@ -1,31 +1,99 @@
-//! File grid: GtkDirectoryList (async, monitored) -> filter -> sort -> GridView.
-//! Only visible cells exist, so 10k-file folders stay responsive.
+//! File view: GtkDirectoryList (async, monitored) -> filter -> sort -> one selection model
+//! shown as a grid, a compact grid or a list (ColumnView). Only visible cells exist,
+//! so 10k-file folders stay responsive.
 
-use super::{Loc, Win};
+use super::pane::Pane;
 use crate::config::Config;
 use crate::util;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 
 const ATTRS: &str = "standard::name,standard::display-name,standard::icon,standard::type,\
 standard::is-hidden,standard::is-backup,standard::is-symlink,standard::size,standard::content-type,\
 time::modified,thumbnail::path,thumbnail::is-valid,access::can-read";
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Mode {
+    Grid,
+    Compact,
+    List,
+}
+
+impl Mode {
+    pub fn parse(s: &str) -> Mode {
+        match s {
+            "list" => Mode::List,
+            "compact" => Mode::Compact,
+            _ => Mode::Grid,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Grid => "grid",
+            Mode::Compact => "compact",
+            Mode::List => "list",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SortKey {
+    Name,
+    Size,
+    Modified,
+    Type,
+}
+
+impl SortKey {
+    fn parse(s: &str) -> SortKey {
+        match s {
+            "size" => SortKey::Size,
+            "modified" => SortKey::Modified,
+            "type" => SortKey::Type,
+            _ => SortKey::Name,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Size => "size",
+            SortKey::Modified => "modified",
+            SortKey::Type => "type",
+        }
+    }
+}
+
+/// Shared state the cell factories read while binding.
+#[derive(Default)]
+struct Look {
+    folder_color: RefCell<Option<String>>,
+    /// folder key (see `folder_key`) -> icon string from config
+    folder_icons: RefCell<HashMap<String, String>>,
+    icon_size: Cell<i32>,
+}
+
 pub struct Files {
     pub widget: gtk::Stack,
     dir: gtk::DirectoryList,
     filtered: gtk::FilterListModel,
-    selection: gtk::MultiSelection,
+    pub selection: gtk::MultiSelection,
     grid: gtk::GridView,
+    compact: gtk::GridView,
+    list: gtk::ColumnView,
+    mode: Cell<Mode>,
     filter: gtk::CustomFilter,
     sorter: gtk::CustomSorter,
     show_hidden: Rc<Cell<bool>>,
     folders_first: Rc<Cell<bool>>,
-    icon_size: Rc<Cell<i32>>,
+    sort_key: Rc<Cell<SortKey>>,
+    sort_desc: Rc<Cell<bool>>,
+    syncing_sort: Cell<bool>,
+    look: Rc<Look>,
     filter_text: Rc<RefCell<String>>,
-    folder_color: Rc<RefCell<Option<String>>>,
+    pane: Rc<RefCell<Weak<Pane>>>,
     error_title: gtk::Label,
     error_text: gtk::Label,
     error_icon: gtk::Image,
@@ -35,21 +103,31 @@ pub struct Files {
     skeleton_timer: RefCell<Option<glib::SourceId>>,
 }
 
-fn info_file(info: &gio::FileInfo) -> Option<gio::File> {
+pub fn info_file(info: &gio::FileInfo) -> Option<gio::File> {
     info.attribute_object("standard::file").and_downcast::<gio::File>()
+}
+
+/// Config key for a folder: "~/x" for local paths, the URI otherwise.
+pub fn folder_key(f: &gio::File) -> String {
+    match f.path() {
+        Some(p) if f.is_native() => util::contract_tilde(&p.to_string_lossy(), &glib::home_dir().to_string_lossy()),
+        _ => f.uri().to_string(),
+    }
 }
 
 impl Files {
     pub fn new(cfg: &Config) -> Files {
         let show_hidden = Rc::new(Cell::new(cfg.view.show_hidden));
         let folders_first = Rc::new(Cell::new(cfg.view.folders_first));
-        let icon_size = Rc::new(Cell::new(cfg.view.icon_size as i32));
+        let sort_key = Rc::new(Cell::new(SortKey::parse(&cfg.view.sort)));
+        let sort_desc = Rc::new(Cell::new(cfg.view.sort_desc));
         let filter_text = Rc::new(RefCell::new(String::new()));
-        let folder_color: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let look = Rc::new(Look::default());
+        look.icon_size.set(cfg.view.icon_size as i32);
+        let pane: Rc<RefCell<Weak<Pane>>> = Rc::new(RefCell::new(Weak::new()));
 
         let dir = gtk::DirectoryList::new(Some(ATTRS), None::<&gio::File>);
         dir.set_monitored(true);
-        dir.set_io_priority(glib::Priority::DEFAULT);
 
         let (sh, ft) = (show_hidden.clone(), filter_text.clone());
         let filter = gtk::CustomFilter::new(move |o| {
@@ -60,14 +138,26 @@ impl Files {
             let q = ft.borrow();
             q.is_empty() || i.display_name().to_lowercase().contains(q.as_str())
         });
-        let ff = folders_first.clone();
+        let (ff, sk, sd) = (folders_first.clone(), sort_key.clone(), sort_desc.clone());
         let sorter = gtk::CustomSorter::new(move |a, b| {
             let (Some(a), Some(b)) = (a.downcast_ref::<gio::FileInfo>(), b.downcast_ref::<gio::FileInfo>()) else {
                 return gtk::Ordering::Equal;
             };
-            let dir = |i: &gio::FileInfo| i.file_type() == gio::FileType::Directory;
-            let o = if ff.get() { dir(b).cmp(&dir(a)) } else { std::cmp::Ordering::Equal };
-            o.then_with(|| util::natural_cmp(&a.display_name(), &b.display_name())).into()
+            let is_dir = |i: &gio::FileInfo| i.file_type() == gio::FileType::Directory;
+            let first = if ff.get() { is_dir(b).cmp(&is_dir(a)) } else { std::cmp::Ordering::Equal };
+            let name = || util::natural_cmp(&a.display_name(), &b.display_name());
+            let key = match sk.get() {
+                SortKey::Name => name(),
+                SortKey::Size => a.size().cmp(&b.size()).then_with(name),
+                SortKey::Modified => a
+                    .modification_date_time()
+                    .map(|d| d.to_unix())
+                    .cmp(&b.modification_date_time().map(|d| d.to_unix()))
+                    .then_with(name),
+                SortKey::Type => a.content_type().cmp(&b.content_type()).then_with(name),
+            };
+            let key = if sd.get() { key.reverse() } else { key };
+            first.then(key).into()
         });
         let filtered = gtk::FilterListModel::new(Some(dir.clone()), Some(filter.clone()));
         filtered.set_incremental(true);
@@ -75,100 +165,45 @@ impl Files {
         sorted.set_incremental(true);
         let selection = gtk::MultiSelection::new(Some(sorted));
 
-        let factory = gtk::SignalListItemFactory::new();
-        let isz = icon_size.clone();
-        factory.connect_setup(move |_, o| {
-            let li = o.downcast_ref::<gtk::ListItem>().unwrap();
-            let vb = gtk::Box::new(gtk::Orientation::Vertical, 6);
-            let s = isz.get();
-            let img = gtk::Image::new();
-            img.set_pixel_size(s);
-            let pic = gtk::Picture::new();
-            pic.set_content_fit(gtk::ContentFit::Contain);
-            pic.set_size_request(s, s);
-            pic.set_can_shrink(true);
-            pic.add_css_class("file-thumb");
-            pic.set_visible(false);
-            let lbl = gtk::Label::new(None);
-            lbl.add_css_class("file-name");
-            lbl.set_wrap(true);
-            lbl.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-            lbl.set_lines(2);
-            lbl.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            lbl.set_justify(gtk::Justification::Center);
-            lbl.set_max_width_chars(14);
-            lbl.set_width_chars(10);
-            vb.append(&img);
-            vb.append(&pic);
-            vb.append(&lbl);
-            li.set_child(Some(&vb));
-        });
-        let fc = folder_color.clone();
-        factory.connect_bind(move |_, o| {
-            let li = o.downcast_ref::<gtk::ListItem>().unwrap();
-            let Some(info) = li.item().and_downcast::<gio::FileInfo>() else { return };
-            let Some(vb) = li.child().and_downcast::<gtk::Box>() else { return };
-            let img = vb.first_child().and_downcast::<gtk::Image>().unwrap();
-            let pic = img.next_sibling().and_downcast::<gtk::Picture>().unwrap();
-            let lbl = pic.next_sibling().and_downcast::<gtk::Label>().unwrap();
-            let name = info.display_name();
-            lbl.set_text(&name);
-            vb.set_tooltip_text(Some(&name));
-            if info.is_hidden() || info.is_backup() {
-                vb.add_css_class("file-hidden");
-            } else {
-                vb.remove_css_class("file-hidden");
-            }
-            match info.icon() {
-                Some(i) => match fc.borrow().as_deref() {
-                    Some(c) if info.file_type() == gio::FileType::Directory => img.set_from_gicon(&tint_folder(&i, c)),
-                    _ => img.set_from_gicon(&i),
-                },
-                None => img.set_icon_name(Some("text-x-generic")),
-            }
-            img.set_visible(true);
-            pic.set_visible(false);
-            pic.set_paintable(None::<&gdk::Paintable>);
-            // Thumbnail from the XDG cache, if one already exists. Read off the UI thread.
-            let token = info.name().to_string_lossy().to_string();
-            vb.set_widget_name(&token);
-            let thumb = info
-                .attribute_byte_string("thumbnail::path")
-                .filter(|_| !info.has_attribute("thumbnail::is-valid") || info.boolean("thumbnail::is-valid"));
-            if let Some(path) = thumb {
-                let path = path.to_string();
-                let vbw = vb.downgrade();
-                glib::spawn_future_local(async move {
-                    let Ok(Ok(bytes)) = gio::spawn_blocking(move || std::fs::read(path)).await else { return };
-                    let Some(vb) = vbw.upgrade() else { return };
-                    if vb.widget_name() != token {
-                        return; // cell was recycled for another file
-                    }
-                    if let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
-                        let img = vb.first_child().unwrap();
-                        let pic = img.next_sibling().and_downcast::<gtk::Picture>().unwrap();
-                        pic.set_paintable(Some(&tex));
-                        pic.set_visible(true);
-                        img.set_visible(false);
-                    }
-                });
-            }
-        });
-
-        let grid = gtk::GridView::new(Some(selection.clone()), Some(factory));
+        // ---------------- grid
+        let grid = gtk::GridView::new(Some(selection.clone()), Some(grid_factory(&look, &pane)));
         grid.add_css_class("files");
         grid.set_max_columns(64);
-        grid.set_min_columns(1);
         grid.set_enable_rubberband(true);
-        grid.set_single_click_activate(false);
-        let scroll = gtk::ScrolledWindow::new();
-        scroll.set_child(Some(&grid));
-        scroll.set_vexpand(true);
+        // ---------------- compact
+        let compact = gtk::GridView::new(Some(selection.clone()), Some(compact_factory(&look, &pane)));
+        compact.add_css_class("files");
+        compact.add_css_class("compact");
+        compact.set_max_columns(64);
+        compact.set_enable_rubberband(true);
+        // ---------------- list
+        let list = gtk::ColumnView::new(Some(selection.clone()));
+        list.add_css_class("files");
+        list.set_enable_rubberband(true);
+        list.set_show_row_separators(false);
+        list.set_reorderable(false);
+        for (id, title, expand, width) in
+            [("name", "Name", true, 320), ("size", "Size", false, 100), ("type", "Type", false, 180), ("modified", "Modified", false, 170)]
+        {
+            let col = gtk::ColumnViewColumn::new(Some(title), Some(list_factory(id, &look, &pane)));
+            col.set_id(Some(id));
+            col.set_expand(expand);
+            col.set_resizable(true);
+            col.set_fixed_width(width);
+            // a sorter makes the header clickable; the real sorting is ours (folders first etc.)
+            col.set_sorter(Some(&gtk::CustomSorter::new(|_, _| gtk::Ordering::Equal)));
+            list.append_column(&col);
+        }
 
         let widget = gtk::Stack::new();
         widget.set_transition_type(gtk::StackTransitionType::Crossfade);
         widget.set_transition_duration(100);
-        widget.add_named(&scroll, Some("grid"));
+        for (name, child) in [("grid", grid.clone().upcast::<gtk::Widget>()), ("compact", compact.clone().upcast()), ("list", list.clone().upcast())] {
+            let scroll = gtk::ScrolledWindow::new();
+            scroll.set_child(Some(&child));
+            scroll.set_vexpand(true);
+            widget.add_named(&scroll, Some(name));
+        }
 
         // loading skeleton
         let skeleton = gtk::FlowBox::new();
@@ -197,8 +232,7 @@ impl Files {
         }
         widget.add_named(&skeleton, Some("loading"));
 
-        let (empty, empty_icon, empty_title, empty_text) = state_page("folder-open-symbolic");
-        let _ = empty_icon;
+        let (empty, _, empty_title, empty_text) = state_page("folder-open-symbolic");
         widget.add_named(&empty, Some("empty"));
         let (error, error_icon, error_title, error_text) = state_page("dialog-error-symbolic");
         error.add_css_class("error");
@@ -216,19 +250,25 @@ impl Files {
         error.append(&btns);
         widget.add_named(&error, Some("error"));
 
-        Files {
+        let f = Files {
             widget,
             dir,
             filtered,
             selection,
             grid,
+            compact,
+            list,
+            mode: Cell::new(Mode::parse(&cfg.view.default_mode)),
             filter,
             sorter,
             show_hidden,
             folders_first,
-            icon_size,
+            sort_key,
+            sort_desc,
+            syncing_sort: Cell::new(false),
+            look,
             filter_text,
-            folder_color,
+            pane,
             error_title,
             error_text,
             error_icon,
@@ -236,46 +276,44 @@ impl Files {
             empty_text,
             skeleton,
             skeleton_timer: RefCell::new(None),
-        }
+        };
+        f.set_folder_icons(cfg);
+        f.sync_list_sort_indicator();
+        f
     }
 
-    pub fn connect(&self, w: &Rc<Win>) {
-        let weak = Rc::downgrade(w);
-        self.grid.connect_activate(move |g, pos| {
-            let Some(w) = weak.upgrade() else { return };
-            let Some(info) = g.model().and_then(|m| m.item(pos)).and_downcast::<gio::FileInfo>() else { return };
-            let Some(f) = info_file(&info) else { return };
-            if info.file_type() == gio::FileType::Directory || info.file_type() == gio::FileType::Mountable {
-                w.go(Loc::Files(f), true);
-            } else {
-                let launcher = gtk::FileLauncher::new(Some(&f));
-                let weak = Rc::downgrade(&w);
-                launcher.launch(Some(&w.window), gio::Cancellable::NONE, move |r| {
-                    if let (Err(e), Some(w)) = (r, weak.upgrade()) {
-                        if !e.matches(gtk::DialogError::Dismissed) && !e.matches(gtk::DialogError::Cancelled) {
-                            w.show_notice(&format!("Could not open {}: {}", info.display_name(), e.message()), true);
-                        }
-                    }
-                });
+    pub fn connect(&self, pane: &Rc<Pane>) {
+        *self.pane.borrow_mut() = Rc::downgrade(pane);
+        let activate = {
+            let weak = Rc::downgrade(pane);
+            move |pos: u32| {
+                if let Some(p) = weak.upgrade() {
+                    p.activate_item(pos);
+                }
             }
-        });
+        };
+        let a = activate.clone();
+        self.grid.connect_activate(move |_, pos| a(pos));
+        let a = activate.clone();
+        self.compact.connect_activate(move |_, pos| a(pos));
+        self.list.connect_activate(move |_, pos| activate(pos));
 
         // State switch is cheap; the status line counts items, so debounce it while a big
         // folder streams in.
         let pending = Rc::new(Cell::new(false));
         let refresh = {
-            let weak = Rc::downgrade(w);
+            let weak = Rc::downgrade(pane);
             move || {
-                let Some(w) = weak.upgrade() else { return };
-                w.files.update_state(&w);
+                let Some(p) = weak.upgrade() else { return };
+                p.files.update_state(&p);
                 if pending.replace(true) {
                     return;
                 }
-                let (weak, pending) = (Rc::downgrade(&w), pending.clone());
+                let (weak, pending) = (Rc::downgrade(&p), pending.clone());
                 glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
                     pending.set(false);
-                    if let Some(w) = weak.upgrade() {
-                        w.update_status();
+                    if let Some(p) = weak.upgrade() {
+                        p.status_changed();
                     }
                 });
             }
@@ -289,43 +327,104 @@ impl Files {
         let r = refresh.clone();
         self.selection.connect_selection_changed(move |_, _, _| r());
 
-        // Backspace = parent, typing = filter-as-you-type
-        let keys = gtk::EventControllerKey::new();
-        let weak = Rc::downgrade(w);
-        keys.connect_key_pressed(move |_, key, _, mods| {
-            let Some(w) = weak.upgrade() else { return glib::Propagation::Proceed };
-            if key == gdk::Key::BackSpace && mods.is_empty() {
-                w.go_up();
-                return glib::Propagation::Stop;
-            }
-            let plain = !mods.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK);
-            if let Some(c) = key.to_unicode().filter(|c| plain && !c.is_control() && !c.is_whitespace()) {
-                w.filter_entry.grab_focus();
-                w.filter_entry.set_text(&format!("{}{c}", w.filter_entry.text()));
-                w.filter_entry.set_position(-1);
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-        self.grid.add_controller(keys);
+        // List header click -> our sort key
+        let weak = Rc::downgrade(pane);
+        if let Some(s) = self.list.sorter().and_downcast::<gtk::ColumnViewSorter>() {
+            s.connect_changed(move |s, _| {
+                let Some(p) = weak.upgrade() else { return };
+                if p.files.syncing_sort.get() {
+                    return;
+                }
+                let Some(col) = s.primary_sort_column() else { return };
+                let key = SortKey::parse(col.id().as_deref().unwrap_or("name"));
+                let desc = s.primary_sort_order() == gtk::SortType::Descending;
+                p.set_sort(key.name(), desc);
+            });
+        }
+
+        for view in [self.grid.clone().upcast::<gtk::Widget>(), self.compact.clone().upcast(), self.list.clone().upcast()] {
+            // Backspace = parent, typing = filter-as-you-type
+            let keys = gtk::EventControllerKey::new();
+            let weak = Rc::downgrade(pane);
+            keys.connect_key_pressed(move |_, key, _, mods| {
+                let Some(p) = weak.upgrade() else { return glib::Propagation::Proceed };
+                if key == gdk::Key::BackSpace && mods.is_empty() {
+                    p.go_up();
+                    return glib::Propagation::Stop;
+                }
+                if key == gdk::Key::Menu || (key == gdk::Key::F10 && mods == gdk::ModifierType::SHIFT_MASK) {
+                    p.menu_for_selection();
+                    return glib::Propagation::Stop;
+                }
+                let plain = !mods.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK);
+                if let Some(c) = key.to_unicode().filter(|c| plain && !c.is_control() && !c.is_whitespace()) {
+                    p.start_filter(c);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            view.add_controller(keys);
+
+            // right click on empty space
+            let click = gtk::GestureClick::new();
+            click.set_button(3);
+            let weak = Rc::downgrade(pane);
+            let v = view.clone();
+            click.connect_pressed(move |g, _, x, y| {
+                let Some(p) = weak.upgrade() else { return };
+                g.set_state(gtk::EventSequenceState::Claimed);
+                p.files.selection.unselect_all();
+                p.background_menu(&v, x, y);
+            });
+            view.add_controller(click);
+        }
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode.get()
+    }
+
+    pub fn set_mode(&self, m: Mode) {
+        self.mode.set(m);
+        if matches!(self.widget.visible_child_name().as_deref(), Some("grid" | "compact" | "list")) {
+            self.widget.set_visible_child_name(m.name());
+        }
     }
 
     pub fn open(&self, f: &gio::File) {
         self.filter_text.borrow_mut().clear();
         self.filter.changed(gtk::FilterChange::LessStrict);
+        self.selection.unselect_all();
         self.dir.set_file(Some(f));
-        if self.grid.model().is_some_and(|m| m.n_items() > 0) {
+        if self.selection.n_items() > 0 {
             self.grid.scroll_to(0, gtk::ListScrollFlags::NONE, None);
         }
     }
 
+    pub fn reload(&self) {
+        let f = self.dir.file();
+        self.dir.set_file(None::<&gio::File>);
+        self.dir.set_file(f.as_ref());
+    }
+
     pub fn grab_focus(&self) {
-        self.grid.grab_focus();
+        match self.mode.get() {
+            Mode::Grid => self.grid.grab_focus(),
+            Mode::Compact => self.compact.grab_focus(),
+            Mode::List => self.list.grab_focus(),
+        };
+    }
+
+    pub fn filter_text(&self) -> String {
+        self.filter_text.borrow().clone()
     }
 
     pub fn set_filter(&self, text: &str) {
         let t = text.trim().to_lowercase();
         let old = std::mem::replace(&mut *self.filter_text.borrow_mut(), t.clone());
+        if old == t {
+            return;
+        }
         let change = if t.starts_with(&old) {
             gtk::FilterChange::MoreStrict
         } else if old.starts_with(&t) {
@@ -336,38 +435,75 @@ impl Files {
         self.filter.changed(change);
     }
 
-    /// Papirus colour for folder icons (None = theme default). Rebinds visible cells.
+    fn rebind(&self) {
+        // Re-create visible cells (size or icon look changed).
+        for v in [&self.grid, &self.compact] {
+            v.set_model(None::<&gtk::SelectionModel>);
+            v.set_model(Some(&self.selection));
+        }
+        self.list.set_model(None::<&gtk::SelectionModel>);
+        self.list.set_model(Some(&self.selection));
+    }
+
+    /// Papirus colour for folder icons (None = theme default).
     pub fn set_folder_color(&self, c: Option<String>) {
-        if *self.folder_color.borrow() == c {
+        if *self.look.folder_color.borrow() == c {
             return;
         }
-        *self.folder_color.borrow_mut() = c;
-        let m = self.grid.model();
-        self.grid.set_model(None::<&gtk::SelectionModel>);
-        self.grid.set_model(m.as_ref());
+        *self.look.folder_color.borrow_mut() = c;
+        self.rebind();
+    }
+
+    fn set_folder_icons(&self, cfg: &Config) -> bool {
+        let map: HashMap<String, String> =
+            cfg.folders.iter().filter_map(|(k, v)| v.icon.clone().map(|i| (k.clone(), i))).collect();
+        if *self.look.folder_icons.borrow() == map {
+            return false;
+        }
+        *self.look.folder_icons.borrow_mut() = map;
+        true
+    }
+
+    fn sync_list_sort_indicator(&self) {
+        let id = self.sort_key.get().name();
+        let order = if self.sort_desc.get() { gtk::SortType::Descending } else { gtk::SortType::Ascending };
+        let cols = self.list.columns();
+        for i in 0..cols.n_items() {
+            if let Some(c) = cols.item(i).and_downcast::<gtk::ColumnViewColumn>() {
+                if c.id().as_deref() == Some(id) {
+                    self.syncing_sort.set(true);
+                    self.list.sort_by_column(Some(&c), order);
+                    self.syncing_sort.set(false);
+                }
+            }
+        }
     }
 
     pub fn config_changed(&self, cfg: &Config) {
         if self.show_hidden.replace(cfg.view.show_hidden) != cfg.view.show_hidden {
             self.filter.changed(gtk::FilterChange::Different);
         }
-        if self.folders_first.replace(cfg.view.folders_first) != cfg.view.folders_first {
+        let key = SortKey::parse(&cfg.view.sort);
+        let resort = self.folders_first.replace(cfg.view.folders_first) != cfg.view.folders_first
+            | (self.sort_key.replace(key) != key)
+            | (self.sort_desc.replace(cfg.view.sort_desc) != cfg.view.sort_desc);
+        if resort {
             self.sorter.changed(gtk::SorterChange::Different);
+            self.sync_list_sort_indicator();
         }
         let s = cfg.view.icon_size as i32;
-        if self.icon_size.replace(s) != s {
-            // rebuild cells with the new size
-            let m = self.grid.model();
-            self.grid.set_model(None::<&gtk::SelectionModel>);
-            self.grid.set_model(m.as_ref());
+        let resize = self.look.icon_size.replace(s) != s;
+        if self.set_folder_icons(cfg) | resize {
+            self.rebind();
         }
     }
 
-    fn update_state(&self, w: &Rc<Win>) {
+    pub fn update_state(&self, p: &Rc<Pane>) {
         if let Some(id) = self.skeleton_timer.borrow_mut().take() {
             id.remove();
         }
         let n = self.filtered.n_items();
+        let view = self.mode.get().name();
         if let Some(e) = self.dir.error() {
             let (icon, title, text) = describe_error(&e);
             self.error_icon.set_icon_name(Some(icon));
@@ -376,20 +512,22 @@ impl Files {
             self.widget.set_visible_child_name("error");
         } else if self.dir.is_loading() && n == 0 {
             // show the skeleton only if loading takes a moment (no flicker on fast folders)
-            self.widget.set_visible_child_name("grid");
-            let weak = Rc::downgrade(w);
+            self.widget.set_visible_child_name(view);
+            let weak = Rc::downgrade(p);
             let id = glib::timeout_add_local_once(std::time::Duration::from_millis(180), move || {
-                let Some(w) = weak.upgrade() else { return };
-                *w.files.skeleton_timer.borrow_mut() = None;
-                if w.files.dir.is_loading() && w.files.filtered.n_items() == 0 {
-                    for c in w.files.skeleton_children() {
-                        if w.reduced_motion() {
+                let Some(p) = weak.upgrade() else { return };
+                let f = &p.files;
+                *f.skeleton_timer.borrow_mut() = None;
+                if f.dir.is_loading() && f.filtered.n_items() == 0 {
+                    let reduced = p.reduced_motion();
+                    for c in f.skeleton_children() {
+                        if reduced {
                             c.add_css_class("reduced");
                         } else {
                             c.remove_css_class("reduced");
                         }
                     }
-                    w.files.widget.set_visible_child_name("loading");
+                    f.widget.set_visible_child_name("loading");
                 }
             });
             *self.skeleton_timer.borrow_mut() = Some(id);
@@ -407,7 +545,7 @@ impl Files {
             }
             self.widget.set_visible_child_name("empty");
         } else {
-            self.widget.set_visible_child_name("grid");
+            self.widget.set_visible_child_name(view);
         }
     }
 
@@ -427,10 +565,26 @@ impl Files {
         v
     }
 
+    /// Selected items (capped), in view order.
+    pub fn selected_infos(&self) -> Vec<gio::FileInfo> {
+        let sel = self.selection.selection();
+        let mut out = vec![];
+        if let Some((iter, first)) = gtk::BitsetIter::init_first(&sel) {
+            for pos in std::iter::once(first).chain(iter).take(50_000) {
+                if let Some(i) = self.selection.item(pos).and_downcast::<gio::FileInfo>() {
+                    out.push(i);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn item(&self, pos: u32) -> Option<gio::FileInfo> {
+        self.selection.item(pos).and_downcast::<gio::FileInfo>()
+    }
+
     pub fn status_text(&self) -> String {
         let n = self.filtered.n_items();
-        let sel = self.selection.selection();
-        let s = sel.size();
         let mut folders = 0u32;
         for i in 0..n.min(20_000) {
             if let Some(info) = self.filtered.item(i).and_downcast::<gio::FileInfo>() {
@@ -448,20 +602,260 @@ impl Files {
         if self.dir.is_loading() {
             out.push_str(" · loading…");
         }
-        if s > 0 {
-            let mut bytes = 0u64;
-            if let Some((iter, first)) = gtk::BitsetIter::init_first(&sel) {
-                for pos in std::iter::once(first).chain(iter).take(50_000) {
-                    if let Some(info) = self.selection.item(pos).and_downcast::<gio::FileInfo>() {
-                        if info.file_type() != gio::FileType::Directory {
-                            bytes += info.size().max(0) as u64;
-                        }
-                    }
-                }
-            }
-            out.push_str(&format!(" · {s} selected ({})", util::human_size(bytes)));
+        let sel = self.selected_infos();
+        if !sel.is_empty() {
+            let bytes: u64 = sel
+                .iter()
+                .filter(|i| i.file_type() != gio::FileType::Directory)
+                .map(|i| i.size().max(0) as u64)
+                .sum();
+            out.push_str(&format!(" · {} selected ({})", sel.len(), util::human_size(bytes)));
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------- cells
+
+fn item_icon(info: &gio::FileInfo, look: &Look) -> gio::Icon {
+    let is_dir = info.file_type() == gio::FileType::Directory;
+    if is_dir && !look.folder_icons.borrow().is_empty() {
+        if let Some(f) = info_file(info) {
+            if let Some(i) = look.folder_icons.borrow().get(&folder_key(&f)) {
+                return super::icon_from_str(i);
+            }
+        }
+    }
+    let Some(icon) = info.icon() else { return gio::ThemedIcon::new("text-x-generic").upcast() };
+    match look.folder_color.borrow().as_deref() {
+        Some(c) if is_dir => tint_folder(&icon, c),
+        _ => icon,
+    }
+}
+
+/// Right-click menu, middle-click (open in new tab) and drag source for one cell.
+fn attach_cell(w: &gtk::Widget, li: &gtk::ListItem, pane: &Rc<RefCell<Weak<Pane>>>) {
+    let click = gtk::GestureClick::new();
+    click.set_button(0);
+    let (liw, pw) = (li.downgrade(), pane.clone());
+    click.connect_pressed(move |g, n, x, y| {
+        let (Some(li), Some(p)) = (liw.upgrade(), pw.borrow().upgrade()) else { return };
+        let pos = li.position();
+        match g.current_button() {
+            3 => {
+                g.set_state(gtk::EventSequenceState::Claimed);
+                if !li.is_selected() {
+                    p.files.selection.select_item(pos, true);
+                }
+                if let Some(w) = g.widget() {
+                    p.item_menu(&w, x, y);
+                }
+            }
+            2 if n == 1 => {
+                g.set_state(gtk::EventSequenceState::Claimed);
+                p.open_item_in_new_tab(pos);
+            }
+            _ => {}
+        }
+    });
+    w.add_controller(click);
+
+    // Drag out (to the sidebar to pin, or to other apps)
+    let drag = gtk::DragSource::new();
+    drag.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE | gdk::DragAction::LINK);
+    let (liw, pw) = (li.downgrade(), pane.clone());
+    drag.connect_prepare(move |_, _, _| {
+        let (li, p) = (liw.upgrade()?, pw.borrow().upgrade()?);
+        let files: Vec<gio::File> = if li.is_selected() {
+            p.files.selected_infos().iter().filter_map(info_file).collect()
+        } else {
+            li.item().and_downcast::<gio::FileInfo>().and_then(|i| info_file(&i)).into_iter().collect()
+        };
+        if files.is_empty() {
+            return None;
+        }
+        let list = gdk::FileList::from_array(&files);
+        Some(gdk::ContentProvider::for_value(&list.to_value()))
+    });
+    let ww = w.downgrade();
+    drag.connect_drag_begin(move |src, _| {
+        if let Some(w) = ww.upgrade() {
+            src.set_icon(Some(&gtk::WidgetPaintable::new(Some(&w))), 0, 0);
+        }
+    });
+    w.add_controller(drag);
+}
+
+fn grid_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    let (lk, pn) = (look.clone(), pane.clone());
+    factory.connect_setup(move |_, o| {
+        let li = o.downcast_ref::<gtk::ListItem>().unwrap();
+        let vb = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let s = lk.icon_size.get();
+        let img = gtk::Image::new();
+        img.set_pixel_size(s);
+        let pic = gtk::Picture::new();
+        pic.set_content_fit(gtk::ContentFit::Contain);
+        pic.set_size_request(s, s);
+        pic.set_can_shrink(true);
+        pic.add_css_class("file-thumb");
+        pic.set_visible(false);
+        let lbl = gtk::Label::new(None);
+        lbl.add_css_class("file-name");
+        lbl.set_wrap(true);
+        lbl.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        lbl.set_lines(2);
+        lbl.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        lbl.set_justify(gtk::Justification::Center);
+        lbl.set_max_width_chars(14);
+        lbl.set_width_chars(10);
+        vb.append(&img);
+        vb.append(&pic);
+        vb.append(&lbl);
+        attach_cell(vb.upcast_ref(), li, &pn);
+        li.set_child(Some(&vb));
+    });
+    let lk = look.clone();
+    factory.connect_bind(move |_, o| {
+        let li = o.downcast_ref::<gtk::ListItem>().unwrap();
+        let Some(info) = li.item().and_downcast::<gio::FileInfo>() else { return };
+        let Some(vb) = li.child().and_downcast::<gtk::Box>() else { return };
+        let img = vb.first_child().and_downcast::<gtk::Image>().unwrap();
+        let pic = img.next_sibling().and_downcast::<gtk::Picture>().unwrap();
+        let lbl = pic.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        let name = info.display_name();
+        lbl.set_text(&name);
+        vb.set_tooltip_text(Some(&name));
+        set_hidden_class(vb.upcast_ref(), &info);
+        img.set_from_gicon(&item_icon(&info, &lk));
+        img.set_visible(true);
+        pic.set_visible(false);
+        pic.set_paintable(None::<&gdk::Paintable>);
+        // Thumbnail from the XDG cache, if one already exists. Read off the UI thread.
+        let token = info.name().to_string_lossy().to_string();
+        vb.set_widget_name(&token);
+        let thumb = info
+            .attribute_byte_string("thumbnail::path")
+            .filter(|_| !info.has_attribute("thumbnail::is-valid") || info.boolean("thumbnail::is-valid"));
+        if let Some(path) = thumb {
+            let path = path.to_string();
+            let vbw = vb.downgrade();
+            glib::spawn_future_local(async move {
+                let Ok(Ok(bytes)) = gio::spawn_blocking(move || std::fs::read(path)).await else { return };
+                let Some(vb) = vbw.upgrade() else { return };
+                if vb.widget_name() != token {
+                    return; // cell was recycled for another file
+                }
+                if let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
+                    let img = vb.first_child().unwrap();
+                    let pic = img.next_sibling().and_downcast::<gtk::Picture>().unwrap();
+                    pic.set_paintable(Some(&tex));
+                    pic.set_visible(true);
+                    img.set_visible(false);
+                }
+            });
+        }
+    });
+    factory
+}
+
+fn compact_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    let pn = pane.clone();
+    factory.connect_setup(move |_, o| {
+        let li = o.downcast_ref::<gtk::ListItem>().unwrap();
+        let hb = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let img = gtk::Image::new();
+        img.set_pixel_size(24);
+        let lbl = gtk::Label::new(None);
+        lbl.add_css_class("file-name");
+        lbl.set_xalign(0.0);
+        lbl.set_hexpand(true);
+        lbl.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        lbl.set_width_chars(18);
+        lbl.set_max_width_chars(24);
+        hb.append(&img);
+        hb.append(&lbl);
+        attach_cell(hb.upcast_ref(), li, &pn);
+        li.set_child(Some(&hb));
+    });
+    let lk = look.clone();
+    factory.connect_bind(move |_, o| {
+        let li = o.downcast_ref::<gtk::ListItem>().unwrap();
+        let Some(info) = li.item().and_downcast::<gio::FileInfo>() else { return };
+        let Some(hb) = li.child().and_downcast::<gtk::Box>() else { return };
+        let img = hb.first_child().and_downcast::<gtk::Image>().unwrap();
+        let lbl = img.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        img.set_from_gicon(&item_icon(&info, &lk));
+        lbl.set_text(&info.display_name());
+        hb.set_tooltip_text(Some(&info.display_name()));
+        set_hidden_class(hb.upcast_ref(), &info);
+    });
+    factory
+}
+
+fn list_factory(col: &'static str, look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    let pn = pane.clone();
+    factory.connect_setup(move |_, o| {
+        let li = o.downcast_ref::<gtk::ListItem>().unwrap();
+        let hb = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        hb.set_hexpand(true);
+        if col == "name" {
+            let img = gtk::Image::new();
+            img.set_pixel_size(20);
+            hb.append(&img);
+        }
+        let lbl = gtk::Label::new(None);
+        lbl.set_xalign(if col == "size" { 1.0 } else { 0.0 });
+        lbl.set_hexpand(true);
+        lbl.set_ellipsize(if col == "name" { gtk::pango::EllipsizeMode::Middle } else { gtk::pango::EllipsizeMode::End });
+        lbl.add_css_class(if col == "name" { "file-name" } else { "file-meta" });
+        hb.append(&lbl);
+        attach_cell(hb.upcast_ref(), li, &pn);
+        li.set_child(Some(&hb));
+    });
+    let lk = look.clone();
+    factory.connect_bind(move |_, o| {
+        let li = o.downcast_ref::<gtk::ListItem>().unwrap();
+        let Some(info) = li.item().and_downcast::<gio::FileInfo>() else { return };
+        let Some(hb) = li.child().and_downcast::<gtk::Box>() else { return };
+        let lbl = hb.last_child().and_downcast::<gtk::Label>().unwrap();
+        let is_dir = info.file_type() == gio::FileType::Directory;
+        let text = match col {
+            "name" => {
+                if let Some(img) = hb.first_child().and_downcast::<gtk::Image>() {
+                    img.set_from_gicon(&item_icon(&info, &lk));
+                }
+                info.display_name().to_string()
+            }
+            "size" => if is_dir { "—".into() } else { util::human_size(info.size().max(0) as u64) },
+            "type" => {
+                if is_dir {
+                    "Folder".into()
+                } else {
+                    info.content_type().map(|t| gio::content_type_get_description(&t).to_string()).unwrap_or_default()
+                }
+            }
+            _ => info
+                .modification_date_time()
+                .and_then(|d| d.to_local().ok())
+                .and_then(|d| d.format("%-d %b %Y %H:%M").ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+        };
+        lbl.set_text(&text);
+        set_hidden_class(hb.upcast_ref(), &info);
+    });
+    factory
+}
+
+fn set_hidden_class(w: &gtk::Widget, info: &gio::FileInfo) {
+    if info.is_hidden() || info.is_backup() {
+        w.add_css_class("file-hidden");
+    } else {
+        w.remove_css_class("file-hidden");
     }
 }
 
@@ -491,7 +885,12 @@ fn describe_error(e: &glib::Error) -> (&'static str, &'static str, String) {
         ("action-unavailable-symbolic", "Permission denied", "You don't have permission to open this folder.".into())
     } else if e.matches(E::NotFound) {
         ("dialog-question-symbolic", "Folder not found", "It may have been moved, deleted, or its drive was removed.".into())
-    } else if e.matches(E::NotMounted) || e.matches(E::HostNotFound) || e.matches(E::TimedOut) || e.matches(E::ConnectionRefused) || e.matches(E::NetworkUnreachable) {
+    } else if e.matches(E::NotMounted)
+        || e.matches(E::HostNotFound)
+        || e.matches(E::TimedOut)
+        || e.matches(E::ConnectionRefused)
+        || e.matches(E::NetworkUnreachable)
+    {
         ("network-offline-symbolic", "Location unavailable", format!("The network location can't be reached. {}", e.message()))
     } else if e.matches(E::NotDirectory) {
         ("text-x-generic-symbolic", "Not a folder", "This location is a file, not a folder.".into())

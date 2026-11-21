@@ -1,16 +1,21 @@
-//! UI: one `Win` per window. All file system work goes through async GIO calls or
-//! gio::spawn_blocking; the UI thread only builds widgets.
+//! UI: one `Win` per window, holding tabs; each tab holds one pane or two (split view).
+//! All file system work goes through async GIO calls or gio::spawn_blocking.
 
+mod dialogs;
 mod drives_page;
 mod files;
+mod pane;
 mod pathbar;
+mod settings;
 mod sidebar;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, Item};
 use crate::drives::{self, Drive};
 use crate::theme::{self, Appearance, RicePaths, Tokens};
+use files::Mode;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
+use pane::Pane;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
@@ -31,6 +36,22 @@ impl Loc {
     }
 }
 
+pub struct Tab {
+    container: gtk::Box,
+    panes: RefCell<Vec<Rc<Pane>>>,
+    active: Cell<usize>,
+    button: gtk::Box,
+    label: gtk::Label,
+    icon: gtk::Image,
+}
+
+impl Tab {
+    fn active_pane(&self) -> Rc<Pane> {
+        let ps = self.panes.borrow();
+        ps[self.active.get().min(ps.len() - 1)].clone()
+    }
+}
+
 pub struct Win {
     pub window: gtk::ApplicationWindow,
     pub cfg: RefCell<Config>,
@@ -44,10 +65,6 @@ pub struct Win {
     paths: RicePaths,
     pub home: gio::File,
 
-    pub loc: RefCell<Loc>,
-    back: RefCell<Vec<Loc>>,
-    fwd: RefCell<Vec<Loc>>,
-
     pub drives: RefCell<Vec<Drive>>,
     volume_monitor: gio::VolumeMonitor,
     rice_monitors: RefCell<Vec<gio::FileMonitor>>,
@@ -55,15 +72,17 @@ pub struct Win {
     debounce: RefCell<Option<glib::SourceId>>,
     cfg_debounce: RefCell<Option<glib::SourceId>>,
 
-    pub files: files::Files,
-    pub pathbar: pathbar::Pathbar,
+    tabs: RefCell<Vec<Rc<Tab>>>,
+    cur_tab: Cell<usize>,
+    tab_bar: gtk::Box,
+    tab_stack: gtk::Stack,
+
     pub sidebar: sidebar::Sidebar,
-    pub drives_page: drives_page::DrivesPage,
-    content: gtk::Stack,
-    back_btn: gtk::Button,
-    fwd_btn: gtk::Button,
-    up_btn: gtk::Button,
+    pub settings: RefCell<Option<settings::Settings>>,
+    syncing: Cell<bool>,
     hidden_btn: gtk::ToggleButton,
+    split_btn: gtk::ToggleButton,
+    mode_btns: [gtk::ToggleButton; 3],
     pub filter_entry: gtk::SearchEntry,
     status: gtk::Label,
     notice: gtk::Label,
@@ -144,6 +163,19 @@ impl Config {
     }
 }
 
+fn tool_btn(icon: &str, tip: &str) -> gtk::Button {
+    let b = gtk::Button::from_icon_name(icon);
+    b.set_tooltip_text(Some(tip));
+    b
+}
+
+fn toggle_btn(icon: &str, tip: &str) -> gtk::ToggleButton {
+    let b = gtk::ToggleButton::new();
+    b.set_icon_name(icon);
+    b.set_tooltip_text(Some(tip));
+    b
+}
+
 pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     let paths = RicePaths::from_env();
     let tokens = theme::load_active(&paths);
@@ -182,42 +214,65 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
     paned.set_end_child(Some(&main));
 
-    // toolbar
-    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    toolbar.add_css_class("toolbar");
-    let mk = |icon: &str, tip: &str| {
-        let b = gtk::Button::from_icon_name(icon);
-        b.set_tooltip_text(Some(tip));
-        b
-    };
-    let back_btn = mk("go-previous-symbolic", "Back (Alt+Left)");
-    let fwd_btn = mk("go-next-symbolic", "Forward (Alt+Right)");
-    let up_btn = mk("go-up-symbolic", "Parent folder (Alt+Up)");
-    toolbar.append(&back_btn);
-    toolbar.append(&fwd_btn);
-    toolbar.append(&up_btn);
-    let pathbar = pathbar::Pathbar::new();
-    pathbar.widget.set_hexpand(true);
-    toolbar.append(&pathbar.widget);
+    // top bar: tabs on the left, global controls on the right
+    let topbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    topbar.add_css_class("topbar");
+    let tab_scroll = gtk::ScrolledWindow::new();
+    tab_scroll.set_vscrollbar_policy(gtk::PolicyType::Never);
+    tab_scroll.set_hscrollbar_policy(gtk::PolicyType::External);
+    tab_scroll.set_hexpand(true);
+    tab_scroll.set_propagate_natural_height(true);
+    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    tab_bar.add_css_class("tabbar");
+    tab_scroll.set_child(Some(&tab_bar));
+    topbar.append(&tab_scroll);
+    let new_tab = tool_btn("tab-new-symbolic", "New tab (Ctrl+T)");
+    new_tab.add_css_class("flat-btn");
+    new_tab.set_action_name(Some("win.new-tab"));
+    topbar.append(&new_tab);
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_width_request(12);
+    topbar.append(&spacer);
     let filter_entry = gtk::SearchEntry::new();
     filter_entry.add_css_class("filter-entry");
     filter_entry.set_placeholder_text(Some("Filter"));
-    filter_entry.set_width_chars(16);
-    toolbar.append(&filter_entry);
-    let hidden_btn = gtk::ToggleButton::new();
-    hidden_btn.set_icon_name("view-reveal-symbolic");
-    hidden_btn.set_tooltip_text(Some("Show hidden files (Ctrl+H)"));
-    toolbar.append(&hidden_btn);
-    main.append(&toolbar);
+    filter_entry.set_width_chars(14);
+    topbar.append(&filter_entry);
+    let modes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    modes.add_css_class("segmented");
+    let grid_b = toggle_btn("view-grid-symbolic", "Grid (Ctrl+1)");
+    let compact_b = toggle_btn("view-compact-symbolic", "Compact (Ctrl+2)");
+    let list_b = toggle_btn("view-list-symbolic", "List (Ctrl+3)");
+    compact_b.set_group(Some(&grid_b));
+    list_b.set_group(Some(&grid_b));
+    for b in [&grid_b, &compact_b, &list_b] {
+        b.add_css_class("flat-btn");
+        modes.append(b);
+    }
+    topbar.append(&modes);
+    let hidden_btn = toggle_btn("view-reveal-symbolic", "Show hidden files (Ctrl+H)");
+    hidden_btn.add_css_class("flat-btn");
+    topbar.append(&hidden_btn);
+    let split_btn = toggle_btn("view-dual-symbolic", "Split view (F3)");
+    split_btn.add_css_class("flat-btn");
+    topbar.append(&split_btn);
+    let menu = gio::Menu::new();
+    menu.append(Some("Settings"), Some("win.settings"));
+    menu.append(Some("Open config file"), Some("win.open-config"));
+    let sec = gio::Menu::new();
+    sec.append(Some("New section in sidebar…"), Some("win.section-new"));
+    menu.append_section(None, &sec);
+    let menu_btn = gtk::MenuButton::new();
+    menu_btn.set_icon_name("open-menu-symbolic");
+    menu_btn.set_tooltip_text(Some("Menu"));
+    menu_btn.set_menu_model(Some(&menu));
+    menu_btn.add_css_class("flat-btn");
+    topbar.append(&menu_btn);
+    main.append(&topbar);
 
-    let content = gtk::Stack::new();
-    content.set_vexpand(true);
-    content.set_transition_type(gtk::StackTransitionType::Crossfade);
-    let files = files::Files::new(&cfg);
-    let drives_page = drives_page::DrivesPage::new();
-    content.add_named(&files.widget, Some("files"));
-    content.add_named(&drives_page.widget, Some("drives"));
-    main.append(&content);
+    let tab_stack = gtk::Stack::new();
+    tab_stack.set_vexpand(true);
+    main.append(&tab_stack);
 
     // status bar
     let statusbar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -243,24 +298,22 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
         provider,
         paths,
         home: home.clone(),
-        loc: RefCell::new(Loc::Files(home.clone())),
-        back: RefCell::new(vec![]),
-        fwd: RefCell::new(vec![]),
-        drives: RefCell::new(vec![]),
+        drives: RefCell::new(drives::list()),
         volume_monitor: gio::VolumeMonitor::get(),
         rice_monitors: RefCell::new(vec![]),
         cfg_monitor: RefCell::new(None),
         debounce: RefCell::new(None),
         cfg_debounce: RefCell::new(None),
-        files,
-        pathbar,
+        tabs: RefCell::new(vec![]),
+        cur_tab: Cell::new(0),
+        tab_bar,
+        tab_stack,
         sidebar,
-        drives_page,
-        content,
-        back_btn,
-        fwd_btn,
-        up_btn,
+        settings: RefCell::new(None),
+        syncing: Cell::new(false),
         hidden_btn,
+        split_btn,
+        mode_btns: [grid_b, compact_b, list_b],
         filter_entry,
         status,
         notice,
@@ -270,14 +323,11 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     }
 
     w.apply_theme();
-    w.files.connect(&w);
-    w.pathbar.connect(&w);
     w.connect_toolbar();
     w.install_actions();
     w.watch_drives();
     w.watch_rice();
     w.watch_config();
-    w.reload_drives();
 
     let start = start
         .map(|f| match f.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE) {
@@ -287,14 +337,17 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
         })
         .map(Loc::Files)
         .unwrap_or(Loc::Files(home));
-    w.go(start, false);
+    w.new_tab(start, true);
+    w.sidebar.rebuild(&w);
 
     // Periodic usage refresh (free space changes while copying, downloading…)
     let weak = Rc::downgrade(&w);
     glib::timeout_add_seconds_local(30, move || {
         let Some(w) = weak.upgrade() else { return glib::ControlFlow::Break };
         w.sidebar.refresh_usage();
-        w.drives_page.refresh_usage();
+        for p in w.all_panes() {
+            p.drives_page.refresh_usage();
+        }
         glib::ControlFlow::Continue
     });
 
@@ -302,15 +355,305 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     let weak = Rc::downgrade(&w);
     w.window.connect_close_request(move |_| {
         if let Some(w) = weak.upgrade() {
+            if let Some(s) = w.settings.borrow_mut().take() {
+                s.window.destroy();
+            }
             WINDOWS.with(|ws| ws.borrow_mut().retain(|x| !Rc::ptr_eq(x, &w)));
         }
         glib::Propagation::Proceed
     });
     w.window.present();
-    w.files.grab_focus();
+    w.active().files.grab_focus();
 }
 
 impl Win {
+    // ------------------------------------------------------------------ panes & tabs
+    pub fn active_tab(&self) -> Rc<Tab> {
+        let t = self.tabs.borrow();
+        t[self.cur_tab.get().min(t.len() - 1)].clone()
+    }
+
+    pub fn active(&self) -> Rc<Pane> {
+        self.active_tab().active_pane()
+    }
+
+    pub fn active_loc(&self) -> Loc {
+        if self.tabs.borrow().is_empty() {
+            return Loc::Files(self.home.clone());
+        }
+        self.active().loc.borrow().clone()
+    }
+
+    pub fn all_panes(&self) -> Vec<Rc<Pane>> {
+        self.tabs.borrow().iter().flat_map(|t| t.panes.borrow().clone()).collect()
+    }
+
+    fn is_active(&self, p: &Pane) -> bool {
+        !self.tabs.borrow().is_empty() && std::ptr::eq(Rc::as_ptr(&self.active()), p)
+    }
+
+    /// Navigate the active pane.
+    pub fn go(self: &Rc<Self>, loc: Loc, record: bool) {
+        self.active().go(loc, record);
+    }
+
+    pub fn new_tab(self: &Rc<Self>, loc: Loc, select: bool) {
+        let pane = Pane::new(self, loc);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        container.append(&pane.widget);
+
+        let button = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        button.add_css_class("tab");
+        let icon = gtk::Image::from_icon_name("folder-symbolic");
+        icon.set_pixel_size(14);
+        let label = gtk::Label::new(None);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        label.set_max_width_chars(18);
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("tab-close");
+        close.set_tooltip_text(Some("Close tab (Ctrl+W)"));
+        button.append(&icon);
+        button.append(&label);
+        button.append(&close);
+
+        let tab = Rc::new(Tab { container, panes: RefCell::new(vec![pane.clone()]), active: Cell::new(0), button, label, icon });
+        let name = format!("tab-{:p}", Rc::as_ptr(&tab));
+        self.tab_stack.add_named(&tab.container, Some(&name));
+        self.tab_bar.append(&tab.button);
+
+        let click = gtk::GestureClick::new();
+        click.set_button(0);
+        let (weak, tw) = (Rc::downgrade(self), Rc::downgrade(&tab));
+        click.connect_released(move |g, _, _, _| {
+            let (Some(w), Some(t)) = (weak.upgrade(), tw.upgrade()) else { return };
+            let Some(i) = w.tab_index(&t) else { return };
+            match g.current_button() {
+                2 => w.close_tab(i),
+                1 => w.select_tab(i),
+                _ => {}
+            }
+        });
+        tab.button.add_controller(click);
+        let (weak, tw) = (Rc::downgrade(self), Rc::downgrade(&tab));
+        close.connect_clicked(move |_| {
+            let (Some(w), Some(t)) = (weak.upgrade(), tw.upgrade()) else { return };
+            if let Some(i) = w.tab_index(&t) {
+                w.close_tab(i);
+            }
+        });
+
+        self.tabs.borrow_mut().push(tab.clone());
+        self.update_tab(&tab);
+        self.tab_bar.set_visible(self.tabs.borrow().len() > 1);
+        if select || self.tabs.borrow().len() == 1 {
+            self.select_tab(self.tabs.borrow().len() - 1);
+        }
+    }
+
+    fn tab_index(&self, t: &Rc<Tab>) -> Option<usize> {
+        self.tabs.borrow().iter().position(|x| Rc::ptr_eq(x, t))
+    }
+
+    pub fn select_tab(self: &Rc<Self>, i: usize) {
+        let Some(tab) = self.tabs.borrow().get(i).cloned() else { return };
+        self.cur_tab.set(i);
+        self.tab_stack.set_visible_child(&tab.container);
+        for (j, t) in self.tabs.borrow().iter().enumerate() {
+            if j == i {
+                t.button.add_css_class("active");
+            } else {
+                t.button.remove_css_class("active");
+            }
+        }
+        self.active_changed();
+        tab.active_pane().files.grab_focus();
+    }
+
+    pub fn close_tab(self: &Rc<Self>, i: usize) {
+        if self.tabs.borrow().len() <= 1 {
+            self.window.close();
+            return;
+        }
+        let tab = self.tabs.borrow_mut().remove(i);
+        self.tab_stack.remove(&tab.container);
+        self.tab_bar.remove(&tab.button);
+        self.tab_bar.set_visible(self.tabs.borrow().len() > 1);
+        let cur = self.cur_tab.get();
+        let next = if cur > i || cur >= self.tabs.borrow().len() { cur.saturating_sub(1) } else { cur };
+        self.select_tab(next);
+    }
+
+    fn cycle_tab(self: &Rc<Self>, d: isize) {
+        let n = self.tabs.borrow().len() as isize;
+        if n > 1 {
+            self.select_tab(((self.cur_tab.get() as isize + d).rem_euclid(n)) as usize);
+        }
+    }
+
+    fn update_tab(&self, tab: &Tab) {
+        let titles: Vec<String> = tab.panes.borrow().iter().map(|p| p.title()).collect();
+        tab.label.set_text(&titles.join(" | "));
+        tab.button.set_tooltip_text(Some(&titles.join("  |  ")));
+        let split = titles.len() > 1;
+        tab.icon.set_icon_name(Some(if split { "view-dual-symbolic" } else { "folder-symbolic" }));
+    }
+
+    pub fn toggle_split(self: &Rc<Self>) {
+        let tab = self.active_tab();
+        let n = tab.panes.borrow().len();
+        if n == 1 {
+            let loc = tab.active_pane().loc.borrow().clone();
+            self.split_with(&tab, loc);
+        } else {
+            // close the inactive pane, keep the one you're in
+            let keep = tab.active_pane();
+            for p in tab.panes.borrow().iter() {
+                if let Some(parent) = p.widget.parent() {
+                    if let Some(paned) = parent.downcast_ref::<gtk::Paned>() {
+                        paned.set_start_child(None::<&gtk::Widget>);
+                        paned.set_end_child(None::<&gtk::Widget>);
+                    }
+                }
+            }
+            while let Some(c) = tab.container.first_child() {
+                tab.container.remove(&c);
+            }
+            tab.container.append(&keep.widget);
+            *tab.panes.borrow_mut() = vec![keep];
+            tab.active.set(0);
+            self.update_tab(&tab);
+            self.active_changed();
+        }
+    }
+
+    fn split_with(self: &Rc<Self>, tab: &Rc<Tab>, loc: Loc) {
+        if tab.panes.borrow().len() > 1 {
+            // already split: just show it in the other pane
+            let other = 1 - tab.active.get().min(1);
+            let p = tab.panes.borrow()[other].clone();
+            p.go(loc, true);
+            return;
+        }
+        let first = tab.panes.borrow()[0].clone();
+        let second = Pane::new(self, loc);
+        tab.container.remove(&first.widget);
+        let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+        paned.set_hexpand(true);
+        paned.set_start_child(Some(&first.widget));
+        paned.set_end_child(Some(&second.widget));
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(true);
+        paned.set_shrink_start_child(false);
+        paned.set_shrink_end_child(false);
+        tab.container.append(&paned);
+        // equal halves once allocated
+        let pw = paned.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(p) = pw.upgrade() {
+                p.set_position(p.width() / 2);
+            }
+        });
+        tab.panes.borrow_mut().push(second.clone());
+        tab.active.set(1);
+        self.update_tab(tab);
+        self.active_changed();
+        second.files.grab_focus();
+    }
+
+    pub fn set_active_pane(self: &Rc<Self>, p: &Rc<Pane>) {
+        let tab = self.active_tab();
+        let Some(i) = tab.panes.borrow().iter().position(|x| Rc::ptr_eq(x, p)) else { return };
+        if tab.active.get() != i {
+            tab.active.set(i);
+            self.active_changed();
+        }
+    }
+
+    /// Refresh everything that follows the active pane.
+    fn active_changed(self: &Rc<Self>) {
+        let tab = self.active_tab();
+        let split = tab.panes.borrow().len() > 1;
+        for (i, p) in tab.panes.borrow().iter().enumerate() {
+            if split && i == tab.active.get() {
+                p.widget.add_css_class("active-pane");
+            } else {
+                p.widget.remove_css_class("active-pane");
+            }
+        }
+        let p = tab.active_pane();
+        self.syncing.set(true);
+        self.filter_entry.set_text(&p.files.filter_text());
+        self.split_btn.set_active(split);
+        self.syncing.set(false);
+        self.sync_toolbar();
+        self.sidebar.sync_selection(&p.loc.borrow());
+        self.update_title();
+        self.update_status();
+    }
+
+    /// Called by a pane after it navigated.
+    pub fn pane_navigated(self: &Rc<Self>, p: &Pane) {
+        let tabs = self.tabs.borrow().clone();
+        if let Some(t) = tabs.iter().find(|t| t.panes.borrow().iter().any(|x| std::ptr::eq(Rc::as_ptr(x), p))) {
+            self.update_tab(t);
+        }
+        if self.is_active(p) {
+            self.syncing.set(true);
+            self.filter_entry.set_text("");
+            self.syncing.set(false);
+            self.sync_toolbar();
+            self.sidebar.sync_selection(&p.loc.borrow());
+            self.update_title();
+            self.update_status();
+        }
+    }
+
+    fn update_title(&self) {
+        let t = self.active().title();
+        self.window.set_title(Some(&format!("{t} — Burrow")));
+    }
+
+    /// View mode buttons and hidden toggle follow the active pane / config.
+    pub fn sync_toolbar(&self) {
+        if self.tabs.borrow().is_empty() {
+            return;
+        }
+        self.syncing.set(true);
+        let p = self.active();
+        let is_files = matches!(&*p.loc.borrow(), Loc::Files(_));
+        let idx = match p.files.mode() {
+            Mode::Grid => 0,
+            Mode::Compact => 1,
+            Mode::List => 2,
+        };
+        self.mode_btns[idx].set_active(true);
+        for b in &self.mode_btns {
+            b.set_sensitive(is_files);
+        }
+        self.hidden_btn.set_active(self.cfg.borrow().view.show_hidden);
+        self.syncing.set(false);
+    }
+
+    pub fn update_status(&self) {
+        if self.tabs.borrow().is_empty() {
+            return;
+        }
+        self.status.set_text(&self.active().status_text());
+    }
+
+    pub fn launch(self: &Rc<Self>, f: &gio::File) {
+        let launcher = gtk::FileLauncher::new(Some(f));
+        let weak = Rc::downgrade(self);
+        let name = display_name(f, &self.home);
+        launcher.launch(Some(&self.window), gio::Cancellable::NONE, move |r| {
+            if let (Err(e), Some(w)) = (r, weak.upgrade()) {
+                if !e.matches(gtk::DialogError::Dismissed) && !e.matches(gtk::DialogError::Cancelled) {
+                    w.show_notice(&format!("Could not open {name}: {}", e.message()), true);
+                }
+            }
+        });
+    }
+
     // ------------------------------------------------------------------ theme
     pub fn appearance(&self) -> Appearance {
         let c = self.cfg.borrow();
@@ -327,10 +670,19 @@ impl Win {
         self.appearance().reduced_motion
     }
 
+    pub fn folder_color(&self) -> Option<String> {
+        let fc = self.cfg.borrow().appearance.folder_color.trim().to_lowercase();
+        match fc.as_str() {
+            "none" | "" => None,
+            "rice" => Some(theme::papirus_folder_color(&self.tokens.borrow()).to_string()),
+            c if theme::is_papirus_color(c) => Some(c.to_string()),
+            _ => None,
+        }
+    }
+
     fn apply_theme(&self) {
-        let t = self.tokens.borrow();
         let a = self.appearance();
-        self.provider.load_from_string(&theme::css(&t, &a));
+        self.provider.load_from_string(&theme::css(&self.tokens.borrow(), &a));
         if let Some(s) = gtk::Settings::default() {
             s.set_gtk_font_name(Some(&format!("{} 11", a.font)));
             let cfg_theme = self.cfg.borrow().appearance.icon_theme.trim().to_string();
@@ -341,14 +693,9 @@ impl Win {
                 }
             }
         }
-        let fc = self.cfg.borrow().appearance.folder_color.trim().to_lowercase();
-        self.files.set_folder_color(match fc.as_str() {
-            "none" | "" => None,
-            "rice" => Some(theme::papirus_folder_color(&t).to_string()),
-            c if theme::is_papirus_color(c) => Some(c.to_string()),
-            _ => None,
-        });
-        self.content.set_transition_duration(if a.reduced_motion { 0 } else { 140 });
+        for p in self.all_panes() {
+            p.apply_look(self);
+        }
     }
 
     /// Watch the switcher's `current` file and the active rice's files; re-theme on change.
@@ -460,13 +807,19 @@ impl Win {
         });
     }
 
-    /// Re-apply everything that depends on the config.
+    /// Re-apply everything that depends on the config (after a file edit or a UI change).
     pub fn config_changed(self: &Rc<Self>) {
         self.apply_theme();
-        self.files.config_changed(&self.cfg.borrow());
-        self.hidden_btn.set_active(self.cfg.borrow().view.show_hidden);
+        let cfg = self.cfg.borrow().clone();
+        for p in self.all_panes() {
+            p.files.config_changed(&cfg);
+            p.drives_page.rebuild(self);
+        }
+        self.sync_toolbar();
         self.sidebar.rebuild(self);
-        self.drives_page.rebuild(self);
+        if let Some(s) = self.settings.borrow().as_ref() {
+            s.sync(self);
+        }
     }
 
     /// Save after a change made in the UI. Atomic, off the UI thread.
@@ -477,15 +830,24 @@ impl Win {
         }
         let text = self.cfg.borrow().to_toml();
         *self.cfg_text.borrow_mut() = text.clone();
-        let weak_win = self.window.downgrade();
         let notice = self.notice.downgrade();
         glib::spawn_future_local(async move {
             let res = gio::spawn_blocking(move || config::save_atomic(&config::config_path(), &text)).await;
-            if let (Ok(Err(e)), Some(n), Some(_)) = (res, notice.upgrade(), weak_win.upgrade()) {
+            if let (Ok(Err(e)), Some(n)) = (res, notice.upgrade()) {
                 n.set_text(&format!("Could not save config: {e}"));
-                n.add_css_class("error");
             }
         });
+    }
+
+    /// Change the config from the UI: mutate, save, re-apply.
+    pub fn edit_config(self: &Rc<Self>, f: impl FnOnce(&mut Config)) {
+        {
+            let mut c = self.cfg.borrow_mut();
+            f(&mut c);
+            c.sanitize();
+        }
+        self.save_config();
+        self.config_changed();
     }
 
     pub fn show_notice(&self, text: &str, error: bool) {
@@ -530,13 +892,15 @@ impl Win {
         let weak = Rc::downgrade(self);
         m.connect_mount_removed(move |_, mount| {
             let Some(w) = weak.upgrade() else { return };
-            // If we were inside the removed drive, leave it instead of showing errors.
+            // Panes inside the removed drive leave it instead of showing errors.
             let root = mount.root();
-            let inside = matches!(&*w.loc.borrow(), Loc::Files(f) if f.equal(&root) || f.has_prefix(&root));
             w.reload_drives();
-            if inside {
-                w.show_notice(&format!("{} was removed", mount.name()), true);
-                w.go(Loc::Files(w.home.clone()), true);
+            for p in w.all_panes() {
+                let inside = matches!(&*p.loc.borrow(), Loc::Files(f) if f.equal(&root) || f.has_prefix(&root));
+                if inside {
+                    w.show_notice(&format!("{} was removed", mount.name()), true);
+                    p.go(Loc::Files(w.home.clone()), true);
+                }
             }
         });
     }
@@ -544,7 +908,9 @@ impl Win {
     pub fn reload_drives(self: &Rc<Self>) {
         *self.drives.borrow_mut() = drives::list();
         self.sidebar.rebuild(self);
-        self.drives_page.rebuild(self);
+        for p in self.all_panes() {
+            p.drives_page.rebuild(self);
+        }
     }
 
     pub fn drive_display_name(&self, d: &Drive) -> String {
@@ -555,23 +921,27 @@ impl Win {
         self.cfg.borrow().drive(&d.key).icon.as_deref().map(icon_from_str).unwrap_or_else(|| d.icon.clone())
     }
 
-    /// Open a drive: mount first if needed.
+    /// Open a drive in the active pane: mount first if needed.
     pub fn open_drive(self: &Rc<Self>, key: &str) {
         let Some(d) = self.drives.borrow().iter().find(|d| d.key == key).cloned() else { return };
         if let Some(root) = &d.root {
             self.go(Loc::Files(root.clone()), true);
             return;
         }
+        self.mount_drive(&d, true);
+    }
+
+    fn mount_drive(self: &Rc<Self>, d: &Drive, open: bool) {
         let Some(v) = d.volume.clone() else { return };
         let op = gtk::MountOperation::new(Some(&self.window));
         let weak = Rc::downgrade(self);
-        let name = self.drive_display_name(&d);
+        let name = self.drive_display_name(d);
         self.show_notice(&format!("Mounting {name}…"), false);
         v.clone().mount(gio::MountMountFlags::NONE, Some(&op), gio::Cancellable::NONE, move |res| {
             let Some(w) = weak.upgrade() else { return };
             match res {
                 Ok(()) => {
-                    if let Some(root) = v.get_mount().map(|m| m.root()) {
+                    if let (true, Some(root)) = (open, v.get_mount().map(|m| m.root())) {
                         w.go(Loc::Files(root), true);
                     }
                 }
@@ -594,11 +964,13 @@ impl Win {
                 Err(e) => w.show_notice(&format!("Could not {verb} {name}: {}", e.message()), true),
             }
         };
-        // Leave the drive first so our own directory monitor doesn't keep it busy.
-        if let (Some(root), Loc::Files(f)) = (&d.root, &*self.loc.borrow()) {
-            if f.equal(root) || f.has_prefix(root) {
-                let w = self.clone();
-                glib::idle_add_local_once(move || w.go(Loc::Files(w.home.clone()), true));
+        // Leave the drive first so our own directory monitors don't keep it busy.
+        if let Some(root) = &d.root {
+            for p in self.all_panes() {
+                let inside = matches!(&*p.loc.borrow(), Loc::Files(f) if f.equal(root) || f.has_prefix(root));
+                if inside {
+                    p.go(Loc::Files(self.home.clone()), true);
+                }
             }
         }
         if let Some(m) = d.mount.clone().filter(|m| m.can_eject()) {
@@ -610,120 +982,55 @@ impl Win {
         }
     }
 
-    // ------------------------------------------------------------------ navigation
-    pub fn go(self: &Rc<Self>, loc: Loc, record: bool) {
-        let prev = self.loc.borrow().clone();
-        if record && !prev.same(&loc) {
-            self.back.borrow_mut().push(prev);
-            self.fwd.borrow_mut().clear();
-        }
-        *self.loc.borrow_mut() = loc.clone();
-        self.filter_entry.set_text("");
-        match &loc {
-            Loc::Files(f) => {
-                self.content.set_visible_child_name("files");
-                self.files.open(f);
-                self.pathbar.set_file(f, &self.home);
-                self.window.set_title(Some(&format!("{} — Burrow", display_name(f, &self.home))));
-            }
-            Loc::Drives => {
-                self.content.set_visible_child_name("drives");
-                self.pathbar.set_drives();
-                self.drives_page.refresh_usage();
-                self.window.set_title(Some("Drives — Burrow"));
-            }
-        }
-        self.sidebar.sync_selection(&loc);
-        self.update_nav();
-        self.update_status();
-    }
-
-    fn update_nav(&self) {
-        self.back_btn.set_sensitive(!self.back.borrow().is_empty());
-        self.fwd_btn.set_sensitive(!self.fwd.borrow().is_empty());
-        let up = matches!(&*self.loc.borrow(), Loc::Files(f) if f.parent().is_some());
-        self.up_btn.set_sensitive(up);
-    }
-
-    pub fn go_back(self: &Rc<Self>) {
-        let Some(l) = self.back.borrow_mut().pop() else { return };
-        self.fwd.borrow_mut().push(self.loc.borrow().clone());
-        self.go(l, false);
-    }
-    pub fn go_forward(self: &Rc<Self>) {
-        let Some(l) = self.fwd.borrow_mut().pop() else { return };
-        self.back.borrow_mut().push(self.loc.borrow().clone());
-        self.go(l, false);
-    }
-    pub fn go_up(self: &Rc<Self>) {
-        let p = match &*self.loc.borrow() {
-            Loc::Files(f) => f.parent(),
-            Loc::Drives => None,
-        };
-        if let Some(p) = p {
-            self.go(Loc::Files(p), true);
-        }
-    }
-
-    pub fn update_status(&self) {
-        let text = match &*self.loc.borrow() {
-            Loc::Drives => {
-                let n = self.drives_page.count.get();
-                format!("{n} drive{}", if n == 1 { "" } else { "s" })
-            }
-            Loc::Files(_) => self.files.status_text(),
-        };
-        self.status.set_text(&text);
-    }
-
     // ------------------------------------------------------------------ toolbar / actions
     fn connect_toolbar(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        self.back_btn.connect_clicked(move |_| {
-            if let Some(w) = weak.upgrade() {
-                w.go_back()
-            }
-        });
-        let weak = Rc::downgrade(self);
-        self.fwd_btn.connect_clicked(move |_| {
-            if let Some(w) = weak.upgrade() {
-                w.go_forward()
-            }
-        });
-        let weak = Rc::downgrade(self);
-        self.up_btn.connect_clicked(move |_| {
-            if let Some(w) = weak.upgrade() {
-                w.go_up()
-            }
-        });
-        self.hidden_btn.set_active(self.cfg.borrow().view.show_hidden);
-        let weak = Rc::downgrade(self);
         self.hidden_btn.connect_toggled(move |b| {
             let Some(w) = weak.upgrade() else { return };
-            if w.cfg.borrow().view.show_hidden == b.is_active() {
+            if w.syncing.get() || w.cfg.borrow().view.show_hidden == b.is_active() {
                 return;
             }
-            w.cfg.borrow_mut().view.show_hidden = b.is_active();
-            w.files.config_changed(&w.cfg.borrow());
-            w.save_config();
+            w.edit_config(|c| c.view.show_hidden = b.is_active());
         });
         let weak = Rc::downgrade(self);
+        self.split_btn.connect_toggled(move |b| {
+            let Some(w) = weak.upgrade() else { return };
+            if w.syncing.get() {
+                return;
+            }
+            let split = w.active_tab().panes.borrow().len() > 1;
+            if split != b.is_active() {
+                w.toggle_split();
+            }
+        });
+        for (i, b) in self.mode_btns.iter().enumerate() {
+            let weak = Rc::downgrade(self);
+            b.connect_toggled(move |b| {
+                let Some(w) = weak.upgrade() else { return };
+                if w.syncing.get() || !b.is_active() {
+                    return;
+                }
+                w.active().set_mode([Mode::Grid, Mode::Compact, Mode::List][i]);
+            });
+        }
+        let weak = Rc::downgrade(self);
         self.filter_entry.connect_search_changed(move |e| {
-            if let Some(w) = weak.upgrade() {
-                w.files.set_filter(&e.text());
+            let Some(w) = weak.upgrade() else { return };
+            if !w.syncing.get() {
+                w.active().files.set_filter(&e.text());
             }
         });
         let weak = Rc::downgrade(self);
         self.filter_entry.connect_stop_search(move |e| {
             e.set_text("");
             if let Some(w) = weak.upgrade() {
-                w.files.grab_focus();
+                w.active().files.grab_focus();
             }
         });
         let weak = Rc::downgrade(self);
         self.filter_entry.connect_activate(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.files.grab_focus();
+                w.active().files.grab_focus();
             }
         });
     }
@@ -739,30 +1046,127 @@ impl Win {
                 }
             });
             self.window.add_action(&a);
-            app.set_accels_for_action(&format!("win.{name}"), accels);
+            if !accels.is_empty() {
+                app.set_accels_for_action(&format!("win.{name}"), accels);
+            }
         };
-        add("back", &["<Alt>Left", "<Alt>KP_Left", "Back"], Box::new(|w| w.go_back()));
-        add("forward", &["<Alt>Right", "<Alt>KP_Right", "Forward"], Box::new(|w| w.go_forward()));
-        add("up", &["<Alt>Up"], Box::new(|w| w.go_up()));
+        add("back", &["<Alt>Left", "<Alt>KP_Left", "Back"], Box::new(|w| w.active().go_back()));
+        add("forward", &["<Alt>Right", "<Alt>KP_Right", "Forward"], Box::new(|w| w.active().go_forward()));
+        add("up", &["<Alt>Up"], Box::new(|w| w.active().go_up()));
         add("home", &["<Alt>Home"], Box::new(|w| w.go(Loc::Files(w.home.clone()), true)));
-        add("location", &["<Ctrl>l", "F6"], Box::new(|w| w.pathbar.start_editing()));
-        add("filter", &["<Ctrl>f"], Box::new(|w| { w.filter_entry.grab_focus(); }));
+        add("location", &["<Ctrl>l", "F6"], Box::new(|w| w.active().pathbar.start_editing()));
+        add("filter", &["<Ctrl>f"], Box::new(|w| {
+            w.filter_entry.grab_focus();
+        }));
         add("hidden", &["<Ctrl>h"], Box::new(|w| w.hidden_btn.set_active(!w.hidden_btn.is_active())));
         add("reload", &["F5", "<Ctrl>r"], Box::new(|w| {
-            let l = w.loc.borrow().clone();
-            w.go(l, false);
+            w.active().reload();
             w.reload_drives();
         }));
         add("drives", &["<Ctrl>d"], Box::new(|w| w.go(Loc::Drives, true)));
-        add("close", &["<Ctrl>w", "<Ctrl>q"], Box::new(|w| w.window.close()));
+        add("new-tab", &["<Ctrl>t"], Box::new(|w| {
+            let loc = w.active_loc();
+            w.new_tab(loc, true);
+        }));
+        add("close-tab", &["<Ctrl>w"], Box::new(|w| w.close_tab(w.cur_tab.get())));
+        add("next-tab", &["<Ctrl>Tab", "<Ctrl>Page_Down"], Box::new(|w| w.cycle_tab(1)));
+        add("prev-tab", &["<Ctrl><Shift>Tab", "<Ctrl>Page_Up", "<Ctrl><Shift>ISO_Left_Tab"], Box::new(|w| w.cycle_tab(-1)));
+        add("split", &["F3"], Box::new(|w| w.toggle_split()));
+        add("other-pane", &["<Ctrl>grave"], Box::new(|w| {
+            let t = w.active_tab();
+            if t.panes.borrow().len() > 1 {
+                let o = 1 - t.active.get().min(1);
+                let p = t.panes.borrow()[o].clone();
+                w.set_active_pane(&p);
+                p.files.grab_focus();
+            }
+        }));
+        add("mode-grid", &["<Ctrl>1"], Box::new(|w| w.active().set_mode(Mode::Grid)));
+        add("mode-compact", &["<Ctrl>2"], Box::new(|w| w.active().set_mode(Mode::Compact)));
+        add("mode-list", &["<Ctrl>3"], Box::new(|w| w.active().set_mode(Mode::List)));
+        add("quit", &["<Ctrl>q"], Box::new(|w| w.window.close()));
+        add("settings", &["<Ctrl>comma"], Box::new(|w| settings::Settings::present(w)));
+        add("open-config", &[], Box::new(|w| w.launch(&gio::File::for_path(config::config_path()))));
+        add("section-new", &[], Box::new(|w| w.sidebar.new_section(w)));
+        for i in 1..=8u32 {
+            let a = gio::SimpleAction::new(&format!("tab-{i}"), None);
+            let weak = Rc::downgrade(self);
+            a.connect_activate(move |_, _| {
+                if let Some(w) = weak.upgrade() {
+                    w.select_tab(i as usize - 1);
+                }
+            });
+            self.window.add_action(&a);
+            app.set_accels_for_action(&format!("win.tab-{i}"), &[&format!("<Alt>{i}")]);
+        }
 
-        let goto = gio::SimpleAction::new("goto-uri", Some(glib::VariantTy::STRING));
+        let add_s = |name: &str, f: Box<dyn Fn(&Rc<Win>, String)>| {
+            let a = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+            let weak = Rc::downgrade(self);
+            a.connect_activate(move |_, p| {
+                if let (Some(w), Some(s)) = (weak.upgrade(), p.and_then(|p| p.get::<String>())) {
+                    f(&w, s)
+                }
+            });
+            self.window.add_action(&a);
+        };
+        add_s("goto-uri", Box::new(|w, uri| w.go(Loc::Files(gio::File::for_uri(&uri)), true)));
+        add_s("open-uri", Box::new(|w, uri| {
+            let f = gio::File::for_uri(&uri);
+            let weak = Rc::downgrade(w);
+            // directory -> navigate, file -> default app (type query is async)
+            f.clone().query_info_async(
+                "standard::type",
+                gio::FileQueryInfoFlags::NONE,
+                glib::Priority::DEFAULT,
+                gio::Cancellable::NONE,
+                move |r| {
+                    let Some(w) = weak.upgrade() else { return };
+                    match r.map(|i| i.file_type()) {
+                        Ok(gio::FileType::Directory) => w.go(Loc::Files(f), true),
+                        _ => w.launch(&f),
+                    }
+                },
+            );
+        }));
+        add_s("open-tab", Box::new(|w, uri| w.new_tab(Loc::Files(gio::File::for_uri(&uri)), false)));
+        add_s("open-split", Box::new(|w, uri| {
+            let tab = w.active_tab();
+            w.split_with(&tab, Loc::Files(gio::File::for_uri(&uri)));
+        }));
+        add_s("copy-path", Box::new(|w, uri| {
+            let f = gio::File::for_uri(&uri);
+            w.window.clipboard().set_text(&f.parse_name());
+            w.show_notice("Path copied", false);
+        }));
+        add_s("view-mode", Box::new(|w, m| w.active().set_mode(Mode::parse(&m))));
+        add_s("folder-icon", Box::new(|w, uri| {
+            let key = files::folder_key(&gio::File::for_uri(&uri));
+            let weak = Rc::downgrade(w);
+            dialogs::pick_icon(&w.window, "Folder icon", false, move |icon| {
+                let Some(w) = weak.upgrade() else { return };
+                w.edit_config(|c| c.folders.entry(key.clone()).or_default().icon = Some(icon));
+            });
+        }));
+        add_s("folder-icon-reset", Box::new(|w, uri| {
+            let key = files::folder_key(&gio::File::for_uri(&uri));
+            w.edit_config(|c| {
+                if let Some(e) = c.folders.get_mut(&key) {
+                    e.icon = None;
+                }
+            });
+        }));
+
+        // pin(uri, section id)
+        let pin = gio::SimpleAction::new("pin", Some(&glib::VariantType::new("(ss)").unwrap()));
         let weak = Rc::downgrade(self);
-        goto.connect_activate(move |_, p| {
-            let (Some(w), Some(uri)) = (weak.upgrade(), p.and_then(|p| p.get::<String>())) else { return };
-            w.go(Loc::Files(gio::File::for_uri(&uri)), true);
+        pin.connect_activate(move |_, p| {
+            let (Some(w), Some((uri, sid))) = (weak.upgrade(), p.and_then(|p| p.get::<(String, String)>())) else { return };
+            w.pin_folder(&gio::File::for_uri(&uri), &sid, None);
         });
-        self.window.add_action(&goto);
+        self.window.add_action(&pin);
+
+        self.sidebar.install_actions(self);
 
         // Mouse back/forward buttons
         let click = gtk::GestureClick::new();
@@ -771,12 +1175,44 @@ impl Win {
         click.connect_pressed(move |g, _, _, _| {
             let Some(w) = weak.upgrade() else { return };
             match g.current_button() {
-                8 => w.go_back(),
-                9 => w.go_forward(),
+                8 => w.active().go_back(),
+                9 => w.active().go_forward(),
                 _ => {}
             }
         });
         self.window.add_controller(click);
+    }
+
+    /// Add a folder to a sidebar section (at `index`, or the end). No duplicates per section.
+    pub fn pin_folder(self: &Rc<Self>, f: &gio::File, section_id: &str, index: Option<usize>) {
+        let path = config_path_for(f);
+        let name = display_name(f, &self.home);
+        let mut dup = false;
+        self.edit_config(|c| {
+            let Some(s) = c.sections.iter_mut().find(|s| s.id == section_id) else { return };
+            if s.items.iter().any(|i| matches!(i, Item::Folder { path: p, .. } if *p == path)) {
+                dup = true;
+                return;
+            }
+            let it = Item::Folder { path, label: None, icon: None };
+            match index {
+                Some(i) if i <= s.items.len() => s.items.insert(i, it),
+                _ => s.items.push(it),
+            }
+        });
+        if dup {
+            self.show_notice(&format!("{name} is already in that section"), false);
+        } else {
+            self.show_notice(&format!("Pinned {name}"), false);
+        }
+    }
+}
+
+/// How a folder is written into the config: "~/x" for local, URI otherwise.
+pub fn config_path_for(f: &gio::File) -> String {
+    match f.path() {
+        Some(p) if f.is_native() => crate::util::contract_tilde(&p.to_string_lossy(), &glib::home_dir().to_string_lossy()),
+        _ => f.uri().to_string(),
     }
 }
 

@@ -1,6 +1,7 @@
 //! Breadcrumb path bar; click empty space or Ctrl+L to type a path or URI.
 
-use super::{Loc, Win};
+use super::Loc;
+use super::pane::Pane;
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
@@ -37,7 +38,7 @@ impl Pathbar {
         Pathbar { widget, crumbs, frame, entry }
     }
 
-    pub fn connect(&self, w: &Rc<Win>) {
+    pub fn connect(&self, w: &Rc<Pane>) {
         let click = gtk::GestureClick::new();
         let weak = Rc::downgrade(w);
         click.connect_released(move |g, _, x, y| {
@@ -64,7 +65,11 @@ impl Pathbar {
             }
             match parse_location(&text) {
                 Some(f) => w.go(Loc::Files(f), true),
-                None => w.show_notice("That doesn't look like a path or URI", true),
+                None => {
+                    if let Some(win) = w.win() {
+                        win.show_notice("That doesn't look like a path or URI", true)
+                    }
+                }
             }
             w.files.grab_focus();
         });

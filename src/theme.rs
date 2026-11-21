@@ -359,6 +359,10 @@ pub fn papirus_folder_color(t: &Tokens) -> &'static str {
         .unwrap_or("red")
 }
 
+pub fn papirus_color_names() -> Vec<&'static str> {
+    PAPIRUS_FOLDERS.iter().map(|(n, _)| *n).collect()
+}
+
 pub fn is_papirus_color(name: &str) -> bool {
     PAPIRUS_FOLDERS.iter().any(|(n, _)| *n == name)
 }

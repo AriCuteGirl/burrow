@@ -55,6 +55,9 @@ pub struct ViewCfg {
     pub icon_size: u32,
     /// Show the "Drives" overview page in the sidebar
     pub drives_page: bool,
+    /// "name", "size", "modified" or "type"
+    pub sort: String,
+    pub sort_desc: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -116,7 +119,15 @@ impl Default for AppearanceCfg {
 
 impl Default for ViewCfg {
     fn default() -> Self {
-        ViewCfg { default_mode: "grid".into(), show_hidden: false, folders_first: true, icon_size: 64, drives_page: true }
+        ViewCfg {
+            default_mode: "grid".into(),
+            show_hidden: false,
+            folders_first: true,
+            icon_size: 64,
+            drives_page: true,
+            sort: "name".into(),
+            sort_desc: false,
+        }
     }
 }
 
@@ -193,6 +204,15 @@ impl Config {
         if !matches!(self.view.default_mode.as_str(), "grid" | "list" | "compact") {
             self.view.default_mode = "grid".into();
         }
+        if !matches!(self.view.sort.as_str(), "name" | "size" | "modified" | "type") {
+            self.view.sort = "name".into();
+        }
+        for f in self.folders.values_mut() {
+            if f.view.as_deref().is_some_and(|v| !matches!(v, "grid" | "list" | "compact")) {
+                f.view = None;
+            }
+        }
+        self.folders.retain(|_, f| f.view.is_some() || f.icon.is_some());
         // unique, non-empty section ids
         let mut seen = std::collections::HashSet::new();
         for (i, s) in self.sections.iter_mut().enumerate() {
