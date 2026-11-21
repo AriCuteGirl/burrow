@@ -20,7 +20,6 @@ enum Target {
 pub struct Sidebar {
     pub widget: gtk::Box,
     title: gtk::Label,
-    subtitle: gtk::Label,
     body: gtk::Box,
     lists: RefCell<Vec<(gtk::ListBox, Rc<Vec<Target>>)>>,
     usage: RefCell<Vec<(gio::File, gtk::ProgressBar, gtk::Label)>>,
@@ -34,18 +33,15 @@ impl Sidebar {
         let title = gtk::Label::new(Some("Burrow"));
         title.add_css_class("app-title");
         title.set_xalign(0.0);
-        let subtitle = gtk::Label::new(None);
-        subtitle.add_css_class("app-subtitle");
-        subtitle.set_xalign(0.0);
+        title.set_margin_bottom(8);
         widget.append(&title);
-        widget.append(&subtitle);
         let scroll = gtk::ScrolledWindow::new();
         scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
         scroll.set_vexpand(true);
         let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
         scroll.set_child(Some(&body));
         widget.append(&scroll);
-        Sidebar { widget, title, subtitle, body, lists: RefCell::new(vec![]), usage: RefCell::new(vec![]) }
+        Sidebar { widget, title, body, lists: RefCell::new(vec![]), usage: RefCell::new(vec![]) }
     }
 
     pub fn rebuild(&self, w: &Rc<Win>) {
@@ -56,7 +52,6 @@ impl Sidebar {
         self.usage.borrow_mut().clear();
         let t = w.tokens.borrow().clone();
         self.title.set_text("Burrow");
-        self.subtitle.set_text(&format!("{} rice", t.rice_name));
 
         let cfg = w.cfg.borrow().clone();
         let drives = w.drives.borrow().clone();

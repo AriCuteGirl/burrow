@@ -67,7 +67,6 @@ pub struct Win {
     pub filter_entry: gtk::SearchEntry,
     status: gtk::Label,
     notice: gtk::Label,
-    rice_label: gtk::Label,
 }
 
 thread_local! {
@@ -229,18 +228,8 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     notice.set_hexpand(true);
     notice.set_xalign(0.0);
     notice.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    let pill = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    pill.add_css_class("pill");
-    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    dot.add_css_class("pill-dot");
-    dot.set_valign(gtk::Align::Center);
-    let rice_label = gtk::Label::new(None);
-    pill.append(&dot);
-    pill.append(&rice_label);
-    pill.set_tooltip_text(Some("Active rice: Burrow re-themes when you switch"));
     statusbar.append(&status);
     statusbar.append(&notice);
-    statusbar.append(&pill);
     main.append(&statusbar);
 
     let home = gio::File::for_path(glib::home_dir());
@@ -275,7 +264,6 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
         filter_entry,
         status,
         notice,
-        rice_label,
     });
     if let Some(e) = cfg_err {
         w.show_notice(&format!("config.toml has an error, using defaults (file left untouched): {e}"), true);
@@ -353,7 +341,6 @@ impl Win {
                 }
             }
         }
-        self.rice_label.set_text(&t.rice_name);
         let fc = self.cfg.borrow().appearance.folder_color.trim().to_lowercase();
         self.files.set_folder_color(match fc.as_str() {
             "none" | "" => None,
