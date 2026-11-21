@@ -441,3 +441,43 @@ scale slider { background: @text; border-radius: 99px; min-width: 14px; min-heig
 scale value { color: @text_faint; font-size: 11px; }
 popover listview row:hover, popover.menu row:hover { background: @surface_alt; }
 popover listview row:selected { background: @sel_bg; }
+
+/* ---------------- phase 2: trash, jobs, danger ---------------- */
+button.danger {
+  background: @danger;
+  color: @bg_deep;
+  border: none;
+  border-radius: $R_SMALL;
+  padding: 6px 14px;
+  font-weight: 700;
+  box-shadow: none;
+}
+button.danger:hover { background: mix(@danger, white, 0.1); }
+button.danger:disabled { opacity: 0.4; }
+.trash-bar {
+  margin: 0 12px 6px 12px;
+  padding: 8px 12px;
+  background: @surface;
+  border: 1px solid @wine;
+  border-radius: $R_SMALL;
+  color: @text_dim;
+}
+.badge {
+  background: @accent_hot;
+  color: @on_accent;
+  border-radius: 99px;
+  padding: 0 7px;
+  font-size: 11px;
+  font-weight: 700;
+}
+menubutton.jobs-button > button {
+  background: @surface;
+  border: 1px solid @crimson;
+  border-radius: $R_SMALL;
+  color: @text;
+  padding: 0 8px;
+  min-height: 22px;
+  box-shadow: none;
+}
+.jobs-list { padding: 4px; }
+.job-row { padding: 6px 4px; }

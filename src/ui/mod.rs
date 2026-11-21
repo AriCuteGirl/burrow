@@ -4,6 +4,7 @@
 mod dialogs;
 mod drives_page;
 mod files;
+mod jobs;
 mod pane;
 mod pathbar;
 mod settings;
@@ -86,6 +87,16 @@ pub struct Win {
     pub filter_entry: gtk::SearchEntry,
     status: gtk::Label,
     notice: gtk::Label,
+    pub jobs: jobs::Jobs,
+    undo: RefCell<Vec<UndoOp>>,
+    pub trash_count: Cell<u64>,
+    trash_monitor: RefCell<Option<gio::FileMonitor>>,
+}
+
+/// Things Ctrl+Z can take back.
+enum UndoOp {
+    /// Paths that went to the trash, and when (unix seconds).
+    Trash { paths: Vec<String>, since: i64 },
 }
 
 thread_local! {
@@ -283,8 +294,10 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     notice.set_hexpand(true);
     notice.set_xalign(0.0);
     notice.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let jobs = jobs::Jobs::new();
     statusbar.append(&status);
     statusbar.append(&notice);
+    statusbar.append(&jobs.button);
     main.append(&statusbar);
 
     let home = gio::File::for_path(glib::home_dir());
@@ -317,6 +330,10 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
         filter_entry,
         status,
         notice,
+        jobs,
+        undo: RefCell::new(vec![]),
+        trash_count: Cell::new(0),
+        trash_monitor: RefCell::new(None),
     });
     if let Some(e) = cfg_err {
         w.show_notice(&format!("config.toml has an error, using defaults (file left untouched): {e}"), true);
@@ -328,6 +345,7 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     w.watch_drives();
     w.watch_rice();
     w.watch_config();
+    w.watch_trash();
 
     let start = start
         .map(|f| match f.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE) {
@@ -1088,6 +1106,17 @@ impl Win {
         add("settings", &["<Ctrl>comma"], Box::new(|w| settings::Settings::present(w)));
         add("open-config", &[], Box::new(|w| w.launch(&gio::File::for_path(config::config_path()))));
         add("section-new", &[], Box::new(|w| w.sidebar.new_section(w)));
+        add("trash", &[], Box::new(|w| {
+            let files = w.active().selected_files();
+            w.trash_files(files);
+        }));
+        add("delete", &[], Box::new(|w| {
+            let files = w.active().selected_files();
+            w.delete_files(files);
+        }));
+        add("restore", &[], Box::new(|w| w.restore_selection()));
+        add("empty-trash", &[], Box::new(|w| w.empty_trash()));
+        add("undo", &["<Ctrl>z"], Box::new(|w| w.undo()));
         for i in 1..=8u32 {
             let a = gio::SimpleAction::new(&format!("tab-{i}"), None);
             let weak = Rc::downgrade(self);
@@ -1257,3 +1286,162 @@ pub fn file_from_config_path(p: &str) -> gio::File {
         gio::File::for_path(p)
     }
 }
+
+impl Win {
+    // ------------------------------------------------------------------ trash & delete
+    pub fn trash_files(self: &Rc<Self>, files: Vec<gio::File>) {
+        if files.is_empty() {
+            return;
+        }
+        let n = files.len();
+        let title = if n == 1 { format!("Moving {} to Trash", display_name(&files[0], &self.home)) } else { format!("Moving {n} items to Trash") };
+        jobs::run(self, &title, move |p, c| crate::ops::trash(&files, p, c), |w, (ok, since), p, cancelled| {
+            let paths: Vec<String> = ok.iter().filter_map(|f| f.path()).map(|p| p.to_string_lossy().to_string()).collect();
+            if !paths.is_empty() {
+                w.undo.borrow_mut().push(UndoOp::Trash { paths, since });
+            }
+            let k = ok.len();
+            let text = if k == 1 { format!("Moved {} to Trash · Ctrl+Z to undo", display_name(&ok[0], &w.home)) } else { format!("Moved {k} items to Trash · Ctrl+Z to undo") };
+            let (msg, err) = jobs::summary(&text, p, cancelled);
+            w.show_notice(&msg, err);
+            w.update_trash_count();
+        });
+    }
+
+    /// Delete for good, after asking.
+    pub fn delete_files(self: &Rc<Self>, files: Vec<gio::File>) {
+        if files.is_empty() {
+            return;
+        }
+        let n = files.len();
+        let what = if n == 1 { format!("“{}”", display_name(&files[0], &self.home)) } else { format!("{n} items") };
+        let weak = Rc::downgrade(self);
+        dialogs::confirm(
+            &self.window,
+            &format!("Delete {what} for good?"),
+            "This can't be undone. Folders are deleted with everything inside them.",
+            "Delete",
+            move || {
+                let Some(w) = weak.upgrade() else { return };
+                let title = format!("Deleting {what}");
+                jobs::run(&w, &title, move |p, c| crate::ops::delete(&files, p, c), move |w, (), p, cancelled| {
+                    let (msg, err) = jobs::summary(&format!("Deleted {n} item{}", if n == 1 { "" } else { "s" }), p, cancelled);
+                    w.show_notice(&msg, err);
+                    w.update_trash_count();
+                });
+            },
+        );
+    }
+
+    fn restore_selection(self: &Rc<Self>) {
+        let items: Vec<crate::ops::Trashed> = self
+            .active()
+            .files
+            .selected_infos()
+            .iter()
+            .filter_map(|i| {
+                let item = files::info_file(i)?;
+                let orig = i.attribute_byte_string("trash::orig-path")?.to_string();
+                Some(crate::ops::Trashed { item, orig, deleted: 0 })
+            })
+            .collect();
+        self.restore_items(items);
+    }
+
+    fn restore_items(self: &Rc<Self>, items: Vec<crate::ops::Trashed>) {
+        if items.is_empty() {
+            return;
+        }
+        let n = items.len();
+        jobs::run(self, &format!("Restoring {n} item{}", if n == 1 { "" } else { "s" }), move |p, c| crate::ops::restore(&items, p, c), |w, k, p, cancelled| {
+            let (msg, err) = jobs::summary(&format!("Restored {k} item{}", if k == 1 { "" } else { "s" }), p, cancelled);
+            w.show_notice(&msg, err);
+            w.update_trash_count();
+        });
+    }
+
+    fn empty_trash(self: &Rc<Self>) {
+        let n = self.trash_count.get();
+        let weak = Rc::downgrade(self);
+        dialogs::confirm(
+            &self.window,
+            "Empty the Trash?",
+            &format!("{n} item{} will be deleted for good. This can't be undone.", if n == 1 { "" } else { "s" }),
+            "Empty Trash",
+            move || {
+                let Some(w) = weak.upgrade() else { return };
+                jobs::run(&w, "Emptying Trash", crate::ops::empty_trash, |w, (), p, cancelled| {
+                    let (msg, err) = jobs::summary("Trash emptied", p, cancelled);
+                    w.show_notice(&msg, err);
+                    w.update_trash_count();
+                });
+            },
+        );
+    }
+
+    fn undo(self: &Rc<Self>) {
+        let Some(op) = self.undo.borrow_mut().pop() else {
+            self.show_notice("Nothing to undo", false);
+            return;
+        };
+        match op {
+            UndoOp::Trash { paths, since } => {
+                let n = paths.len();
+                jobs::run(
+                    self,
+                    &format!("Undo: restoring {n} item{}", if n == 1 { "" } else { "s" }),
+                    move |p, c| {
+                        let all = crate::ops::list_trash(c);
+                        let items = crate::ops::match_trashed(&all, &paths, since);
+                        let missing = paths.len() - items.len();
+                        (crate::ops::restore(&items, p, c), missing)
+                    },
+                    |w, (k, missing), p, cancelled| {
+                        let mut text = format!("Undo: restored {k} item{}", if k == 1 { "" } else { "s" });
+                        if missing > 0 {
+                            text.push_str(&format!(" ({missing} no longer in the Trash)"));
+                        }
+                        let (msg, err) = jobs::summary(&text, p, cancelled);
+                        w.show_notice(&msg, err || missing > 0);
+                        w.update_trash_count();
+                    },
+                );
+            }
+        }
+    }
+
+    fn watch_trash(self: &Rc<Self>) {
+        let t = gio::File::for_uri("trash:///");
+        if let Ok(m) = t.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
+            let weak = Rc::downgrade(self);
+            m.connect_changed(move |_, _, _, _| {
+                if let Some(w) = weak.upgrade() {
+                    w.update_trash_count();
+                }
+            });
+            *self.trash_monitor.borrow_mut() = Some(m);
+        }
+        self.update_trash_count();
+    }
+
+    pub fn update_trash_count(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        gio::File::for_uri("trash:///").query_info_async(
+            "trash::item-count",
+            gio::FileQueryInfoFlags::NONE,
+            glib::Priority::LOW,
+            gio::Cancellable::NONE,
+            move |r| {
+                let (Some(w), Ok(i)) = (weak.upgrade(), r) else { return };
+                let n = i.attribute_uint32("trash::item-count") as u64;
+                if w.trash_count.replace(n) != n {
+                    w.sidebar.rebuild(&w);
+                    for p in w.all_panes() {
+                        p.update_trash_bar(n);
+                    }
+                }
+            },
+        );
+    }
+}
+

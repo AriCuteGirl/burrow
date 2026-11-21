@@ -1,5 +1,6 @@
 mod config;
 mod drives;
+mod ops;
 mod theme;
 mod ui;
 mod util;

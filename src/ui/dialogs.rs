@@ -228,6 +228,38 @@ pub fn pick_icon(parent: &impl IsA<gtk::Window>, title: &str, symbolic_first: bo
     search.grab_focus();
 }
 
+/// Ask before something destructive. The danger button is not the default: Enter cancels.
+pub fn confirm(parent: &impl IsA<gtk::Window>, title: &str, text: &str, danger: &str, on_yes: impl FnOnce() + 'static) {
+    let on_yes = RefCell::new(Some(on_yes));
+    let (win, root) = dialog_window(parent.upcast_ref(), title, 420);
+    let t = gtk::Label::new(Some(text));
+    t.add_css_class("dialog-hint");
+    t.set_xalign(0.0);
+    t.set_wrap(true);
+    t.set_max_width_chars(48);
+    root.append(&t);
+    let (cancel, ok) = button_row(&root, danger);
+    ok.remove_css_class("primary");
+    ok.add_css_class("danger");
+    let ww = win.downgrade();
+    ok.connect_clicked(move |_| {
+        if let Some(f) = on_yes.borrow_mut().take() {
+            f();
+        }
+        if let Some(w) = ww.upgrade() {
+            w.close();
+        }
+    });
+    let ww = win.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(w) = ww.upgrade() {
+            w.close()
+        }
+    });
+    win.present();
+    cancel.grab_focus();
+}
+
 /// Pick a colour; `cb` gets "#rrggbb".
 pub fn pick_color(parent: &impl IsA<gtk::Window>, initial: Option<&str>, cb: impl Fn(String) + 'static) {
     let d = gtk::ColorDialog::builder().title("Section colour").modal(true).with_alpha(false).build();

@@ -153,6 +153,8 @@ impl Pathbar {
             let name = super::display_name(f, home);
             let icon = if f.equal(home) {
                 Some("user-home-symbolic")
+            } else if f.parent().is_none() && f.uri_scheme().as_deref() == Some("trash") {
+                Some("user-trash-symbolic")
             } else if f.parent().is_none() {
                 Some(if f.is_native() { "drive-harddisk-symbolic" } else { "folder-remote-symbolic" })
             } else {

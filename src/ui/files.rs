@@ -13,7 +13,8 @@ use std::rc::{Rc, Weak};
 
 const ATTRS: &str = "standard::name,standard::display-name,standard::icon,standard::type,\
 standard::is-hidden,standard::is-backup,standard::is-symlink,standard::size,standard::content-type,\
-time::modified,thumbnail::path,thumbnail::is-valid,access::can-read";
+time::modified,thumbnail::path,thumbnail::is-valid,access::can-read,access::can-trash,access::can-delete,\
+trash::orig-path,trash::deletion-date";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -352,6 +353,17 @@ impl Files {
                     p.go_up();
                     return glib::Propagation::Stop;
                 }
+                if key == gdk::Key::Delete || key == gdk::Key::KP_Delete {
+                    let files = p.selected_files();
+                    if let Some(w) = p.win() {
+                        if mods.contains(gdk::ModifierType::SHIFT_MASK) || p.in_trash() {
+                            w.delete_files(files);
+                        } else {
+                            w.trash_files(files);
+                        }
+                    }
+                    return glib::Propagation::Stop;
+                }
                 if key == gdk::Key::Menu || (key == gdk::Key::F10 && mods == gdk::ModifierType::SHIFT_MASK) {
                     p.menu_for_selection();
                     return glib::Propagation::Stop;
@@ -539,6 +551,9 @@ impl Files {
             } else if self.dir.n_items() > 0 {
                 self.empty_title.set_text("Only hidden files");
                 self.empty_text.set_text("Press Ctrl+H to show them.");
+            } else if self.dir.file().is_some_and(|f| f.uri_scheme().as_deref() == Some("trash")) {
+                self.empty_title.set_text("The Trash is empty");
+                self.empty_text.set_text("Things you delete wait here until you empty the Trash.");
             } else {
                 self.empty_title.set_text("This folder is empty");
                 self.empty_text.set_text("Drop files here or create something new.");

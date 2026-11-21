@@ -104,8 +104,21 @@ impl Sidebar {
                         let Item::Folder { path, label, icon } = &s.items[ii] else { continue };
                         let f = file_from_config_path(path);
                         let name = label.clone().filter(|l| !l.trim().is_empty()).unwrap_or_else(|| super::display_name(&f, &w.home));
-                        let icon = icon.as_deref().map(icon_from_str).unwrap_or_else(|| gio::ThemedIcon::new("folder-symbolic").upcast());
+                        let is_trash = f.uri_scheme().as_deref() == Some("trash");
+                        let mut icon = icon.as_deref().map(icon_from_str).unwrap_or_else(|| gio::ThemedIcon::new("folder-symbolic").upcast());
+                        let n = w.trash_count.get();
+                        if is_trash && n > 0 && gio::prelude::IconExt::to_string(&icon).is_some_and(|s| s.contains("user-trash")) {
+                            icon = gio::ThemedIcon::new("user-trash-full-symbolic").upcast();
+                        }
                         let r = row(&icon, &name, None);
+                        if is_trash && n > 0 {
+                            let badge = gtk::Label::new(Some(&n.to_string()));
+                            badge.add_css_class("badge");
+                            badge.set_valign(gtk::Align::Center);
+                            if let Some(hb) = r.child().and_downcast::<gtk::Box>() {
+                                hb.append(&badge);
+                            }
+                        }
                         r.set_tooltip_text(Some(&f.parse_name()));
                         let tgt = Target::Folder { file: f, section: si, item: ii };
                         self.attach_row(w, &r, &tgt);
@@ -361,10 +374,18 @@ impl Sidebar {
         });
         let weak = Rc::downgrade(w);
         let rw = r.downgrade();
+        let is_trash = matches!(tgt, Target::Folder { file, .. } if file.uri_scheme().as_deref() == Some("trash"));
         drop.connect_drop(move |_, v, _, y| {
             let (Some(w), Some(r)) = (weak.upgrade(), rw.upgrade()) else { return false };
             r.remove_css_class("drop-before");
             r.remove_css_class("drop-after");
+            // files dropped onto Trash go to the trash
+            if is_trash {
+                if let Ok(list) = v.get::<gdk::FileList>() {
+                    w.trash_files(list.files());
+                    return true;
+                }
+            }
             let after = y > r.height() as f64 / 2.0;
             let pos = r.index() as usize + after as usize;
             handle_drop(&w, v, section, Some(pos))

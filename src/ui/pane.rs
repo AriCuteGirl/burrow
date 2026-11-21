@@ -17,6 +17,9 @@ pub struct Pane {
     pub pathbar: Pathbar,
     pub drives_page: DrivesPage,
     content: gtk::Stack,
+    trash_bar: gtk::Revealer,
+    trash_text: gtk::Label,
+    empty_btn: gtk::Button,
     pub loc: RefCell<Loc>,
     back: RefCell<Vec<Loc>>,
     fwd: RefCell<Vec<Loc>>,
@@ -54,6 +57,28 @@ impl Pane {
         header.append(&pathbar.widget);
         widget.append(&header);
 
+        // shown while browsing the trash
+        let trash_bar = gtk::Revealer::new();
+        let tb = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        tb.add_css_class("trash-bar");
+        let ti = gtk::Image::from_icon_name("user-trash-symbolic");
+        let trash_text = gtk::Label::new(None);
+        trash_text.set_xalign(0.0);
+        trash_text.set_hexpand(true);
+        trash_text.add_css_class("settings-sub");
+        let restore_btn = gtk::Button::with_label("Restore selected");
+        restore_btn.add_css_class("secondary");
+        restore_btn.set_action_name(Some("win.restore"));
+        let empty_btn = gtk::Button::with_label("Empty Trash");
+        empty_btn.add_css_class("danger");
+        empty_btn.set_action_name(Some("win.empty-trash"));
+        tb.append(&ti);
+        tb.append(&trash_text);
+        tb.append(&restore_btn);
+        tb.append(&empty_btn);
+        trash_bar.set_child(Some(&tb));
+        widget.append(&trash_bar);
+
         let content = gtk::Stack::new();
         content.set_vexpand(true);
         content.set_transition_type(gtk::StackTransitionType::Crossfade);
@@ -70,6 +95,9 @@ impl Pane {
             pathbar,
             drives_page,
             content,
+            trash_bar,
+            trash_text,
+            empty_btn,
             loc: RefCell::new(start.clone()),
             back: RefCell::new(vec![]),
             fwd: RefCell::new(vec![]),
@@ -184,6 +212,8 @@ impl Pane {
             }
         }
         self.update_nav();
+        self.trash_bar.set_reveal_child(self.in_trash());
+        self.update_trash_bar(w.trash_count.get());
         w.pane_navigated(self);
     }
 
@@ -218,6 +248,23 @@ impl Pane {
             Loc::Files(_) => self.files.reload(),
             Loc::Drives => self.drives_page.refresh_usage(),
         }
+    }
+
+    pub fn in_trash(&self) -> bool {
+        matches!(&*self.loc.borrow(), Loc::Files(f) if f.uri_scheme().as_deref() == Some("trash"))
+    }
+
+    pub fn update_trash_bar(&self, n: u64) {
+        self.trash_text.set_text(&if n == 0 {
+            "The Trash is empty".to_string()
+        } else {
+            format!("{n} item{} in the Trash · Delete removes for good here", if n == 1 { "" } else { "s" })
+        });
+        self.empty_btn.set_sensitive(n > 0);
+    }
+
+    pub fn selected_files(&self) -> Vec<gio::File> {
+        self.files.selected_infos().iter().filter_map(files::info_file).collect()
     }
 
     pub fn current_file(&self) -> Option<gio::File> {
@@ -345,6 +392,15 @@ impl Pane {
         let misc = gio::Menu::new();
         misc.append(Some("Copy path"), Some(&action("win.copy-path", &uri)));
         menu.append_section(None, &misc);
+        let danger = gio::Menu::new();
+        if self.in_trash() {
+            danger.append(Some("Restore"), Some("win.restore"));
+            danger.append(Some("Delete for good…"), Some("win.delete"));
+        } else {
+            danger.append(Some("Move to Trash"), Some("win.trash"));
+            danger.append(Some("Delete for good…"), Some("win.delete"));
+        }
+        menu.append_section(None, &danger);
         popup_menu(at, &menu, x, y);
     }
 
@@ -371,6 +427,11 @@ impl Pane {
         misc.append(Some("Copy path"), Some(&action("win.copy-path", &uri)));
         misc.append(Some("Reload"), Some("win.reload"));
         menu.append_section(None, &misc);
+        if self.in_trash() {
+            let t = gio::Menu::new();
+            t.append(Some("Empty Trash…"), Some("win.empty-trash"));
+            menu.append_section(None, &t);
+        }
         popup_menu(at, &menu, x, y);
     }
 }
