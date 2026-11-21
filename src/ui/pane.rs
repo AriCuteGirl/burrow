@@ -352,12 +352,12 @@ impl Pane {
 
     /// Keyboard menu key: menu for the selection at the view's centre.
     pub fn menu_for_selection(self: &Rc<Self>) {
-        let v = self.files.widget.clone();
+        let v = self.files.widget.visible_child().unwrap_or_else(|| self.files.widget.clone().upcast());
         let (x, y) = (v.width() as f64 / 2.0, v.height() as f64 / 3.0);
         if self.files.selected_infos().is_empty() {
-            self.background_menu(v.upcast_ref(), x, y);
+            self.background_menu(&v, x, y);
         } else {
-            self.item_menu(v.upcast_ref(), x, y);
+            self.item_menu(&v, x, y);
         }
     }
 
@@ -461,6 +461,9 @@ pub fn action(name: &str, arg: &str) -> String {
 /// Pop a menu at (x, y) of `at`; unparents itself when closed.
 pub fn popup_menu(at: &gtk::Widget, model: &gio::Menu, x: f64, y: f64) {
     let pop = gtk::PopoverMenu::from_model_full(model, gtk::PopoverMenuFlags::NESTED);
+    // GTK puts the menu in a scroll area that can end up shorter than the menu; make it
+    // always take the menu's full height instead of showing a scrollbar.
+    no_scroll(pop.upcast_ref());
     pop.set_parent(at);
     pop.set_has_arrow(false);
     pop.set_halign(gtk::Align::Start);
@@ -481,3 +484,17 @@ pub fn popup_menu(at: &gtk::Widget, model: &gio::Menu, x: f64, y: f64) {
     });
     pop.popup();
 }
+
+fn no_scroll(w: &gtk::Widget) {
+    if let Some(sw) = w.downcast_ref::<gtk::ScrolledWindow>() {
+        sw.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
+        sw.set_propagate_natural_height(true);
+        sw.set_propagate_natural_width(true);
+    }
+    let mut c = w.first_child();
+    while let Some(ch) = c {
+        no_scroll(&ch);
+        c = ch.next_sibling();
+    }
+}
+

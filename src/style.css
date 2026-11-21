@@ -273,7 +273,7 @@ popover > contents, popover.menu > contents {
   background: @surface;
   border: 1px solid @crimson;
   border-radius: $R;
-  box-shadow: $SHADOW;
+  box-shadow: none;
   color: @text;
   padding: 6px;
 }
