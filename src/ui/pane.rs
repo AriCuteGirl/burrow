@@ -464,6 +464,11 @@ pub fn popup_menu(at: &gtk::Widget, model: &gio::Menu, x: f64, y: f64) {
     // GTK puts the menu in a scroll area that can end up shorter than the menu; make it
     // always take the menu's full height instead of showing a scrollbar.
     no_scroll(pop.upcast_ref());
+    // GTK only shows popovers whose parent positions its popups (boxes, rows…); containers
+    // like GtkStack and GtkScrolledWindow don't. Climb to the nearest box and convert the
+    // click position into its coordinates.
+    let (at, x, y) = popover_host(at, x, y);
+    let at = &at;
     pop.set_parent(at);
     pop.set_has_arrow(false);
     pop.set_halign(gtk::Align::Start);
@@ -483,6 +488,24 @@ pub fn popup_menu(at: &gtk::Widget, model: &gio::Menu, x: f64, y: f64) {
         glib::idle_add_local_once(move || p.unparent());
     });
     pop.popup();
+}
+
+fn popover_host(at: &gtk::Widget, x: f64, y: f64) -> (gtk::Widget, f64, f64) {
+    let ok = |w: &gtk::Widget| w.is::<gtk::Box>() || w.is::<gtk::ListBoxRow>() || w.is::<gtk::Button>();
+    let mut host = at.clone();
+    while !ok(&host) {
+        match host.parent() {
+            Some(p) => host = p,
+            None => return (at.clone(), x, y),
+        }
+    }
+    if &host == at {
+        return (host, x, y);
+    }
+    match at.compute_point(&host, &gtk::graphene::Point::new(x as f32, y as f32)) {
+        Some(pt) => (host, pt.x() as f64, pt.y() as f64),
+        None => (at.clone(), x, y),
+    }
 }
 
 fn no_scroll(w: &gtk::Widget) {

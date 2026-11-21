@@ -424,10 +424,8 @@ impl Files {
                 g.set_state(gtk::EventSequenceState::Claimed);
                 p.files.selection.unselect_all();
                 p.files.grab_focus();
-                // GTK doesn't show popovers attached to a GtkStack: attach to the visible page,
-                // which fills the stack, so the coordinates stay the same
-                let at = v.downcast_ref::<gtk::Stack>().and_then(|s| s.visible_child()).unwrap_or_else(|| v.clone());
-                p.background_menu(&at, x, y);
+                // popup_menu() moves the popover to a parent that can show it
+                p.background_menu(&v, x, y);
             });
             view.add_controller(click);
 
