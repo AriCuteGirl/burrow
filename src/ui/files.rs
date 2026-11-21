@@ -651,6 +651,12 @@ impl Files {
         out
     }
 
+    /// Every name in the folder, hidden ones included (for clash checks).
+    pub fn all_names(&self) -> Vec<String> {
+        let s = &self.dir.store;
+        (0..s.n_items()).filter_map(|i| s.item(i).and_downcast::<gio::FileInfo>()).map(|i| i.name().to_string_lossy().to_string()).collect()
+    }
+
     pub fn item(&self, pos: u32) -> Option<gio::FileInfo> {
         self.selection.item(pos).and_downcast::<gio::FileInfo>()
     }

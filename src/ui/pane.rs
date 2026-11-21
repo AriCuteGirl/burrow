@@ -434,8 +434,8 @@ impl Pane {
         if is_dir && sel.len() == 1 && !self.in_trash() {
             edit.append(Some("Paste into folder"), Some(&action("win.paste-into", &uri)));
         }
-        if sel.len() == 1 && !self.in_trash() {
-            edit.append(Some("Rename…"), Some("win.rename"));
+        if !self.in_trash() {
+            edit.append(Some(if sel.len() > 1 { "Rename all…" } else { "Rename…" }), Some("win.rename"));
         }
         menu.append_section(None, &edit);
         let misc = gio::Menu::new();

@@ -2,6 +2,7 @@
 //! All file system work goes through async GIO calls or gio::spawn_blocking.
 
 mod apps;
+mod batch;
 mod archives;
 mod create;
 mod dialogs;
@@ -107,6 +108,8 @@ enum UndoOp {
     NewFolder(gio::File),
     /// A file or shortcut we created: undo moves it to the trash.
     Created(gio::File),
+    /// Batch rename: (renamed file, old name)
+    Batch(Vec<(gio::File, String)>),
 }
 
 thread_local! {
@@ -1468,6 +1471,14 @@ impl Win {
                     }
                 });
             }
+            UndoOp::Batch(items) => {
+                let back: Vec<(gio::File, String)> = items;
+                let n = back.len();
+                jobs::run(self, &format!("Undo: renaming {n} items back"), move |p, c| crate::rename::rename_all(&back, p, c), |w, done, p, cancelled| {
+                    let (msg, err) = jobs::summary(&format!("Undo: {} names restored", done.len()), p, cancelled);
+                    w.show_notice(&msg, err);
+                });
+            }
             UndoOp::Created(f) => {
                 let weak = Rc::downgrade(self);
                 f.trash_async(glib::Priority::DEFAULT, gio::Cancellable::NONE, move |r| {
@@ -1672,10 +1683,11 @@ impl Win {
 
     fn rename_selection(self: &Rc<Self>) {
         let sel = self.active().files.selected_infos();
+        if sel.len() > 1 {
+            self.batch_rename(sel);
+            return;
+        }
         if sel.len() != 1 {
-            if sel.len() > 1 {
-                self.show_notice("Select one item to rename (batch rename is coming)", false);
-            }
             return;
         }
         let info = sel[0].clone();

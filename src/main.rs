@@ -2,6 +2,7 @@ mod archive;
 mod config;
 mod drives;
 mod ops;
+mod rename;
 mod theme;
 mod transfer;
 mod ui;
