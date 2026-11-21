@@ -130,6 +130,7 @@ pub fn list() -> Vec<Drive> {
             mount: Some(m),
         });
     }
+    add_fstab_mounts(&mut out);
     // de-duplicate keys (two partitions with the same label, etc.)
     let mut seen = std::collections::HashMap::<String, u32>::new();
     for d in &mut out {
@@ -158,3 +159,99 @@ pub fn query_usage<F: Fn(Option<(u64, u64)>) + 'static>(root: &gio::File, cb: F)
         },
     );
 }
+
+/// One line of /proc/mounts: (device, mount point, fs type).
+pub fn parse_proc_mounts(text: &str) -> Vec<(String, String, String)> {
+    // fields are space-separated; spaces etc. inside them are octal escapes like \040
+    fn unescape(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
+                let v = (b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0');
+                out.push(v);
+                i += 4;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split(' ');
+            Some((unescape(f.next()?), unescape(f.next()?), f.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// Mounts a user would call "a drive": a real block device mounted somewhere user-facing.
+/// GIO hides plain fstab mounts (no x-gvfs-show), e.g. /mnt/Games.
+pub fn user_facing(dev: &str, mp: &str, home: &str) -> bool {
+    let h = home.trim_end_matches('/');
+    dev.starts_with("/dev/")
+        && !dev.starts_with("/dev/loop")
+        && (["/mnt/", "/media/", "/run/media/", "/srv/"].iter().any(|p| mp.starts_with(p))
+            || (!h.is_empty() && mp.starts_with(&format!("{h}/"))))
+}
+
+/// Reverse lookup in /dev/disk/by-uuid or by-label: which name points at `dev`.
+fn disk_name(dir: &str, dev: &str) -> Option<String> {
+    let target = std::fs::canonicalize(dev).ok()?;
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let p = std::fs::canonicalize(e.path()).ok()?;
+        (p == target).then(|| e.file_name().to_string_lossy().replace("\\x20", " "))
+    })
+}
+
+fn add_fstab_mounts(out: &mut Vec<Drive>) {
+    let Ok(text) = std::fs::read_to_string("/proc/mounts") else { return };
+    let mounts = parse_proc_mounts(&text);
+    let home = glib::home_dir().to_string_lossy().to_string();
+    // devices GIO already shows (a bind-mounted drive must not appear twice)
+    let mut seen: std::collections::HashSet<String> = out
+        .iter()
+        .filter_map(|d| d.root.as_ref()?.path())
+        .filter_map(|p| {
+            let p = p.to_string_lossy().to_string();
+            mounts.iter().find(|(_, mp, _)| *mp == p).map(|(dev, _, _)| dev.clone())
+        })
+        .collect();
+    for (dev, mp, _) in &mounts {
+        if !user_facing(dev, mp, &home) || !seen.insert(dev.clone()) {
+            continue;
+        }
+        let uuid = disk_name("/dev/disk/by-uuid", dev);
+        let label = disk_name("/dev/disk/by-label", dev);
+        let key = uuid.as_ref().map(|u| format!("uuid:{u}")).or_else(|| label.as_ref().map(|l| format!("label:{l}"))).unwrap_or_else(|| format!("dev:{dev}"));
+        let name = label.clone().unwrap_or_else(|| std::path::Path::new(mp).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| mp.clone()));
+        out.push(Drive {
+            key,
+            name,
+            icon: gio::ThemedIcon::new("drive-harddisk-symbolic").upcast(),
+            kind: Kind::Internal,
+            volume: None,
+            mount: None,
+            root: Some(gio::File::for_path(mp)),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_mounts_and_filter() {
+        let t = "/dev/nvme0n1p3 / ext4 rw 0 0\n/dev/sda1 /mnt/Games ext4 rw 0 0\n/dev/sdb1 /mnt/My\\040Disk ntfs3 rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n/dev/nvme0n1p1 /boot/efi vfat rw 0 0\n/dev/loop0 /mnt/iso iso9660 ro 0 0\n";
+        let m = parse_proc_mounts(t);
+        assert_eq!(m[2].1, "/mnt/My Disk");
+        let shown: Vec<&str> = m.iter().filter(|(d, p, _)| user_facing(d, p, "/home/a")).map(|(_, p, _)| p.as_str()).collect();
+        assert_eq!(shown, ["/mnt/Games", "/mnt/My Disk"]);
+        assert!(user_facing("/dev/sdb1", "/home/a/Elements", "/home/a"));
+        assert!(!user_facing("/dev/sdb1", "/home/ab/x", "/home/a"));
+    }
+}
+
