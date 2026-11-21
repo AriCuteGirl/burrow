@@ -407,9 +407,6 @@ impl Pane {
                 arc.append(Some("Extract here"), Some("win.extract-here"));
                 arc.append(Some("Extract to…"), Some("win.extract-to"));
             }
-            if sel.len() == 1 && super::archives::is_disk_image(&names[0]) {
-                arc.append(Some("Mount disk image"), Some(&action("win.mount-image", &uri)));
-            }
             arc.append(Some("Compress…"), Some("win.compress"));
             menu.append_section(None, &arc);
         }

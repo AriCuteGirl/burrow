@@ -1,16 +1,11 @@
-//! Extract here / Extract to… / Compress… and Mount disk image (.iso/.img) in the UI.
+//! Extract here / Extract to… / Compress… in the UI.
 
-use super::{UndoOp, Win, display_name, jobs};
+use super::{UndoOp, Win, jobs};
 use crate::archive::{self, Format};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::path::PathBuf;
 use std::rc::Rc;
-
-pub fn is_disk_image(name: &str) -> bool {
-    let l = name.to_lowercase();
-    l.ends_with(".iso") || l.ends_with(".img")
-}
 
 fn local_paths(files: &[gio::File]) -> Option<Vec<PathBuf>> {
     files.iter().map(|f| f.path().filter(|_| f.is_native())).collect()
@@ -181,62 +176,5 @@ impl Win {
         win.present();
         entry.grab_focus();
         entry.select_region(0, -1);
-    }
-
-    /// Attach a disk image read-only through UDisks and mount it, then open it.
-    pub fn mount_image(self: &Rc<Self>, file: gio::File) {
-        let Some(path) = file.path().filter(|_| file.is_native()) else {
-            self.show_notice("Only local disk images can be mounted", true);
-            return;
-        };
-        let name = display_name(&file, &self.home);
-        jobs::run(
-            self,
-            &format!("Mounting {name}"),
-            move |_p, _c| -> Result<String, String> {
-                let out = std::process::Command::new("udisksctl")
-                    .args(["loop-setup", "--read-only", "-f"])
-                    .arg(&path)
-                    .output()
-                    .map_err(|e| format!("udisksctl: {e}"))?;
-                let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-                if !out.status.success() {
-                    return Err(text.trim().to_string());
-                }
-                // "Mapped file X as /dev/loop0."
-                let dev = text.split_whitespace().find(|w| w.starts_with("/dev/loop")).map(|d| d.trim_end_matches('.').to_string()).ok_or_else(|| text.trim().to_string())?;
-                // desktops often auto-mount it; give that a moment, then mount ourselves if needed
-                std::thread::sleep(std::time::Duration::from_millis(700));
-                let candidates = [dev.clone(), format!("{dev}p1")];
-                let mut last = String::new();
-                for d in candidates {
-                    let o = std::process::Command::new("udisksctl").args(["mount", "-b", &d]).output();
-                    if let Ok(o) = o {
-                        let t = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
-                        // "Mounted /dev/loop0 at /run/media/ari/LABEL"
-                        if let Some(at) = t.split(" at ").nth(1) {
-                            if o.status.success() {
-                                return Ok(at.trim().trim_end_matches('.').to_string());
-                            }
-                        }
-                        if t.contains("AlreadyMounted") {
-                            if let Some(mp) = t.split('`').nth(1) {
-                                return Ok(mp.to_string());
-                            }
-                        }
-                        last = t;
-                    }
-                }
-                Err(last.trim().to_string())
-            },
-            move |w, r, _p, _cancelled| match r {
-                Ok(mp) => {
-                    w.show_notice(&format!("Mounted {name}. Eject it from the sidebar when done"), false);
-                    w.reload_drives();
-                    w.go(super::Loc::Files(gio::File::for_path(mp)), true);
-                }
-                Err(e) => w.show_notice(&format!("Couldn't mount {name}: {}", super::friendly_auth_error(&e)), true),
-            },
-        );
     }
 }

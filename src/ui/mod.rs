@@ -1233,7 +1233,6 @@ impl Win {
                 w.choose_app(files, ctype);
             }
         }));
-        add_s("mount-image", Box::new(|w, uri| w.mount_image(gio::File::for_uri(&uri))));
         add_s("paste-into", Box::new(|w, uri| w.paste_into(gio::File::for_uri(&uri))));
         add_s("view-mode", Box::new(|w, m| w.active().set_mode(Mode::parse(&m))));
         add_s("folder-icon", Box::new(|w, uri| {
