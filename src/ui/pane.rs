@@ -421,16 +421,10 @@ impl Pane {
         let Some(f) = self.current_file() else { return };
         let uri = f.uri().to_string();
         let menu = gio::Menu::new();
-        let view = gio::Menu::new();
-        view.append(Some("Grid"), Some("win.view-mode::grid"));
-        view.append(Some("Compact"), Some("win.view-mode::compact"));
-        view.append(Some("List"), Some("win.view-mode::list"));
-        menu.append_section(Some("View"), &view);
         if !self.in_trash() {
             let edit = gio::Menu::new();
             edit.append(Some("New folder…"), Some("win.new-folder"));
             edit.append(Some("Paste"), Some("win.paste"));
-            edit.append(Some("Select all"), Some("win.select-all"));
             menu.append_section(None, &edit);
         }
         let side = gio::Menu::new();
@@ -466,7 +460,7 @@ pub fn action(name: &str, arg: &str) -> String {
 
 /// Pop a menu at (x, y) of `at`; unparents itself when closed.
 pub fn popup_menu(at: &gtk::Widget, model: &gio::Menu, x: f64, y: f64) {
-    let pop = gtk::PopoverMenu::from_model(Some(model));
+    let pop = gtk::PopoverMenu::from_model_full(model, gtk::PopoverMenuFlags::NESTED);
     pop.set_parent(at);
     pop.set_has_arrow(false);
     pop.set_halign(gtk::Align::Start);
