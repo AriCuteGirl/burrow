@@ -413,6 +413,10 @@ pub fn css(t: &Tokens, a: &Appearance) -> String {
         ("side_bg", t.bg_deep.rgba((op + 0.06).min(1.0))),
         ("sel_bg", t.wine.rgba(0.85)),
         ("hover_bg", t.surface_alt.rgba(0.75)),
+        // GTK's own widgets (focus rings, checkboxes, selections) use these names
+        ("accent_color", t.accent_hot.hex()),
+        ("accent_bg_color", t.accent.hex()),
+        ("accent_fg_color", t.on_accent.hex()),
     ];
     for (k, v) in vars {
         s.push_str(&format!("@define-color {k} {v};\n"));

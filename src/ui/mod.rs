@@ -2,6 +2,7 @@
 //! All file system work goes through async GIO calls or gio::spawn_blocking.
 
 mod dialogs;
+mod dirmodel;
 mod drives_page;
 mod files;
 mod jobs;

@@ -13,7 +13,6 @@ window.burrow {
 }
 .burrow-root {
   background: @win_bg;
-  border: 1px solid @wine;
   border-radius: $R;
 }
 
@@ -398,12 +397,10 @@ rubberband { background: alpha(@accent, 0.18); border: 1px solid @crimson; }
 /* ---------------- dialogs + settings ---------------- */
 window.dialog { background: transparent; }
 .dialog-root {
+  /* Hyprland draws the window border and shadow; drawing our own doubles them */
   background: @bg;
-  border: 1px solid @crimson;
-  border-radius: $R_BIG;
+  border-radius: $R;
   padding: 18px;
-  box-shadow: $SHADOW;
-  margin: 0 8px 8px 0;
 }
 .dialog-title { font-size: 18px; font-weight: 800; color: @text; }
 .dialog-hint { font-size: 12px; color: @text_faint; }
@@ -486,3 +483,8 @@ gridview.files > child .drop-hover, columnview.files .drop-hover {
   border-radius: $R_SMALL;
   box-shadow: inset 0 0 0 2px @accent_hot;
 }
+stack:focus-visible { outline: none; }
+*:focus-visible { outline-color: alpha(@accent_hot, 0.85); }
+checkbutton check { background: @bg; border: 1px solid @crimson; border-radius: 4px; color: @on_accent; }
+checkbutton check:checked { background: @accent; border-color: @accent; }
+checkbutton { color: @text_dim; }

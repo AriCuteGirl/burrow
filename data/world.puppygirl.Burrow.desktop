@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Burrow
+GenericName=File Manager
+Comment=Browse files, drives and network shares, themed by your rice
+Exec=burrow %U
+Icon=system-file-manager
+Terminal=false
+StartupWMClass=world.puppygirl.Burrow
+Categories=System;FileTools;FileManager;GTK;
+MimeType=inode/directory;
+Keywords=files;folders;explorer;drives;

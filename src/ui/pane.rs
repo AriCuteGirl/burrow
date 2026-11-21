@@ -471,6 +471,16 @@ pub fn popup_menu(at: &gtk::Widget, model: &gio::Menu, x: f64, y: f64) {
     pop.set_has_arrow(false);
     pop.set_halign(gtk::Align::Start);
     pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    // Open upwards when clicked in the lower half, so the compositor doesn't squeeze the
+    // menu into a scrolling list.
+    if let Some(root) = at.root() {
+        let rw = root.upcast_ref::<gtk::Widget>();
+        if let Some(pt) = at.compute_point(rw, &gtk::graphene::Point::new(x as f32, y as f32)) {
+            if pt.y() > rw.height() as f32 / 2.0 {
+                pop.set_position(gtk::PositionType::Top);
+            }
+        }
+    }
     pop.connect_closed(|p| {
         let p = p.clone();
         glib::idle_add_local_once(move || p.unparent());

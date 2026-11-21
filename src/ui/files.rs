@@ -2,6 +2,7 @@
 //! shown as a grid, a compact grid or a list (ColumnView). Only visible cells exist,
 //! so 10k-file folders stay responsive.
 
+use super::dirmodel::DirModel;
 use super::pane::Pane;
 use crate::config::Config;
 use crate::util;
@@ -78,7 +79,7 @@ struct Look {
 
 pub struct Files {
     pub widget: gtk::Stack,
-    dir: gtk::DirectoryList,
+    dir: Rc<DirModel>,
     filtered: gtk::FilterListModel,
     pub selection: gtk::MultiSelection,
     grid: gtk::GridView,
@@ -127,8 +128,7 @@ impl Files {
         look.icon_size.set(cfg.view.icon_size as i32);
         let pane: Rc<RefCell<Weak<Pane>>> = Rc::new(RefCell::new(Weak::new()));
 
-        let dir = gtk::DirectoryList::new(Some(ATTRS), None::<&gio::File>);
-        dir.set_monitored(true);
+        let dir = DirModel::new(ATTRS);
 
         let (sh, ft) = (show_hidden.clone(), filter_text.clone());
         let filter = gtk::CustomFilter::new(move |o| {
@@ -160,7 +160,7 @@ impl Files {
             let key = if sd.get() { key.reverse() } else { key };
             first.then(key).into()
         });
-        let filtered = gtk::FilterListModel::new(Some(dir.clone()), Some(filter.clone()));
+        let filtered = gtk::FilterListModel::new(Some(dir.store.clone()), Some(filter.clone()));
         filtered.set_incremental(true);
         let sorted = gtk::SortListModel::new(Some(filtered.clone()), Some(sorter.clone()));
         sorted.set_incremental(true);
@@ -320,9 +320,7 @@ impl Files {
             }
         };
         let r = refresh.clone();
-        self.dir.connect_loading_notify(move |_| r());
-        let r = refresh.clone();
-        self.dir.connect_error_notify(move |_| r());
+        self.dir.connect_state(move || r());
         let r = refresh.clone();
         self.filtered.connect_items_changed(move |_, _, _, _| r());
         let r = refresh.clone();
@@ -354,7 +352,12 @@ impl Files {
         });
         self.widget.add_controller(drop);
 
-        for view in [self.grid.clone().upcast::<gtk::Widget>(), self.compact.clone().upcast(), self.list.clone().upcast()] {
+        // Keys and the empty-space menu live on the whole file area (views AND the
+        // empty/error pages), so Ctrl+V works in an empty folder too. The area itself can
+        // take focus when no view is showing.
+        self.widget.set_focusable(true);
+        {
+            let view = self.widget.clone().upcast::<gtk::Widget>();
             // Backspace = parent, typing = filter-as-you-type
             let keys = gtk::EventControllerKey::new();
             let weak = Rc::downgrade(pane);
@@ -411,7 +414,7 @@ impl Files {
             });
             view.add_controller(keys);
 
-            // right click on empty space
+            // right click on empty space (cells claim their own right clicks first)
             let click = gtk::GestureClick::new();
             click.set_button(3);
             let weak = Rc::downgrade(pane);
@@ -420,9 +423,22 @@ impl Files {
                 let Some(p) = weak.upgrade() else { return };
                 g.set_state(gtk::EventSequenceState::Claimed);
                 p.files.selection.unselect_all();
+                p.files.grab_focus();
                 p.background_menu(&v, x, y);
             });
             view.add_controller(click);
+
+            // a left click on an empty/error page gives the area focus (for Ctrl+V etc.)
+            let focus = gtk::GestureClick::new();
+            let weak = Rc::downgrade(pane);
+            focus.connect_released(move |_, _, _, _| {
+                if let Some(p) = weak.upgrade() {
+                    if !p.files.showing_view() {
+                        p.files.widget.grab_focus();
+                    }
+                }
+            });
+            view.add_controller(focus);
         }
     }
 
@@ -448,12 +464,18 @@ impl Files {
     }
 
     pub fn reload(&self) {
-        let f = self.dir.file();
-        self.dir.set_file(None::<&gio::File>);
-        self.dir.set_file(f.as_ref());
+        self.dir.reload();
+    }
+
+    fn showing_view(&self) -> bool {
+        matches!(self.widget.visible_child_name().as_deref(), Some("grid" | "compact" | "list"))
     }
 
     pub fn grab_focus(&self) {
+        if !self.showing_view() {
+            self.widget.grab_focus();
+            return;
+        }
         match self.mode.get() {
             Mode::Grid => self.grid.grab_focus(),
             Mode::Compact => self.compact.grab_focus(),
