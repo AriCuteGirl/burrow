@@ -2,6 +2,7 @@
 //! All file system work goes through async GIO calls or gio::spawn_blocking.
 
 mod apps;
+mod archives;
 mod create;
 mod dialogs;
 mod dirmodel;
@@ -1124,6 +1125,18 @@ impl Win {
             w.delete_files(files);
         }));
         add("restore", &[], Box::new(|w| w.restore_selection()));
+        add("extract-here", &[], Box::new(|w| {
+            let files = w.active().selected_files();
+            w.extract(files, None);
+        }));
+        add("extract-to", &[], Box::new(|w| {
+            let files = w.active().selected_files();
+            w.extract_to(files);
+        }));
+        add("compress", &[], Box::new(|w| {
+            let files = w.active().selected_files();
+            w.compress_dialog(files);
+        }));
         add("empty-trash", &[], Box::new(|w| w.empty_trash()));
         add("undo", &["<Ctrl>z"], Box::new(|w| w.undo()));
         add("properties", &["<Alt>Return"], Box::new(|w| {
@@ -1217,6 +1230,7 @@ impl Win {
                 w.choose_app(files, ctype);
             }
         }));
+        add_s("mount-image", Box::new(|w, uri| w.mount_image(gio::File::for_uri(&uri))));
         add_s("paste-into", Box::new(|w, uri| w.paste_into(gio::File::for_uri(&uri))));
         add_s("view-mode", Box::new(|w, m| w.active().set_mode(Mode::parse(&m))));
         add_s("folder-icon", Box::new(|w, uri| {

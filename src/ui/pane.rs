@@ -400,6 +400,19 @@ impl Pane {
             open.append(Some("Open terminal here"), Some(&action("win.terminal", &uri)));
         }
         menu.append_section(None, &open);
+        if !self.in_trash() && f.is_native() {
+            let arc = gio::Menu::new();
+            let names: Vec<String> = sel.iter().map(|i| i.name().to_string_lossy().to_string()).collect();
+            if names.iter().any(|n| crate::archive::is_archive(n)) {
+                arc.append(Some("Extract here"), Some("win.extract-here"));
+                arc.append(Some("Extract to…"), Some("win.extract-to"));
+            }
+            if sel.len() == 1 && super::archives::is_disk_image(&names[0]) {
+                arc.append(Some("Mount disk image"), Some(&action("win.mount-image", &uri)));
+            }
+            arc.append(Some("Compress…"), Some("win.compress"));
+            menu.append_section(None, &arc);
+        }
         if is_dir && sel.len() == 1 {
             let side = gio::Menu::new();
             let pin = gio::Menu::new();
