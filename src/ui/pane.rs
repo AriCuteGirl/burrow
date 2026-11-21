@@ -430,6 +430,7 @@ impl Pane {
             misc.append(Some("Create shortcut…"), Some(&action("win.shortcut", &uri)));
         }
         misc.append(Some("Copy path"), Some(&action("win.copy-path", &uri)));
+        misc.append(Some("Properties"), Some("win.properties"));
         menu.append_section(None, &misc);
         let danger = gio::Menu::new();
         if self.in_trash() {
@@ -483,6 +484,7 @@ impl Pane {
         misc.append(Some(if w.cfg.borrow().view.show_hidden { "Hide hidden files" } else { "Show hidden files" }), Some("win.hidden"));
         misc.append(Some("Copy path"), Some(&action("win.copy-path", &uri)));
         misc.append(Some("Reload"), Some("win.reload"));
+        misc.append(Some("Properties"), Some("win.properties"));
         menu.append_section(None, &misc);
         if self.in_trash() {
             let t = gio::Menu::new();

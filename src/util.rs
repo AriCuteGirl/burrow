@@ -93,9 +93,36 @@ pub fn usage(size: u64, free: u64) -> Option<Usage> {
     })
 }
 
+/// "rwxr-xr-x" for the low 9 permission bits.
+pub fn mode_string(mode: u32) -> String {
+    let mut s = String::with_capacity(9);
+    for shift in [6, 3, 0] {
+        let b = (mode >> shift) & 7;
+        s.push(if b & 4 != 0 { 'r' } else { '-' });
+        s.push(if b & 2 != 0 { 'w' } else { '-' });
+        s.push(if b & 1 != 0 { 'x' } else { '-' });
+    }
+    s
+}
+
+/// "Allow executing": add x wherever r is set (like chmod +x for readable classes).
+pub fn with_exec(mode: u32, on: bool) -> u32 {
+    let r = mode & 0o444;
+    if on { mode | (r >> 2) } else { mode & !0o111 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modes() {
+        assert_eq!(mode_string(0o755), "rwxr-xr-x");
+        assert_eq!(mode_string(0o100640), "rw-r-----");
+        assert_eq!(with_exec(0o644, true), 0o755);
+        assert_eq!(with_exec(0o640, true), 0o750);
+        assert_eq!(with_exec(0o755, false), 0o644);
+    }
 
     #[test]
     fn natural_order() {

@@ -10,6 +10,7 @@ mod files;
 mod jobs;
 mod pane;
 mod pathbar;
+mod properties;
 mod settings;
 mod sidebar;
 
@@ -1125,6 +1126,14 @@ impl Win {
         add("restore", &[], Box::new(|w| w.restore_selection()));
         add("empty-trash", &[], Box::new(|w| w.empty_trash()));
         add("undo", &["<Ctrl>z"], Box::new(|w| w.undo()));
+        add("properties", &["<Alt>Return"], Box::new(|w| {
+            let p = w.active();
+            let mut files = p.selected_files();
+            if files.is_empty() {
+                files.extend(p.current_file());
+            }
+            w.properties(files);
+        }));
         // Ctrl+C/X/V/A and F2 are handled by the file views' key controller, so text
         // fields keep their own copy/paste.
         add("copy", &[], Box::new(|w| w.clipboard_set(w.active().selected_files(), false)));
