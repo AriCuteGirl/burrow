@@ -977,7 +977,7 @@ impl Win {
                     }
                 }
                 Err(e) if e.matches(gio::IOErrorEnum::FailedHandled) => {}
-                Err(e) => w.show_notice(&format!("Could not mount {name}: {}", e.message()), true),
+                Err(e) => w.show_notice(&format!("Could not mount {name}: {}", friendly_auth_error(e.message())), true),
             }
         });
     }
@@ -1722,6 +1722,15 @@ impl Win {
                 }
             });
         });
+    }
+}
+
+/// Polkit refusals become a plain explanation instead of a D-Bus error dump.
+pub(crate) fn friendly_auth_error(msg: &str) -> String {
+    if msg.contains("NotAuthorizedCanObtain") || msg.contains("Not authorized") || msg.contains("authentication agent") {
+        "this needs your password, but no password prompt (polkit agent) is running in your session".into()
+    } else {
+        msg.trim().lines().last().unwrap_or(msg).to_string()
     }
 }
 

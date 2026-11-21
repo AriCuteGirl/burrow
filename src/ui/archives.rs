@@ -235,7 +235,7 @@ impl Win {
                     w.reload_drives();
                     w.go(super::Loc::Files(gio::File::for_path(mp)), true);
                 }
-                Err(e) => w.show_notice(&format!("Couldn't mount {name}: {e}"), true),
+                Err(e) => w.show_notice(&format!("Couldn't mount {name}: {}", super::friendly_auth_error(&e)), true),
             },
         );
     }
