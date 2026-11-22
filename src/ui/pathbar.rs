@@ -2,16 +2,20 @@
 
 use super::Loc;
 use super::pane::Pane;
+use super::files;
+use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
-use std::rc::Rc;
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 
 pub struct Pathbar {
     pub widget: gtk::Stack,
     crumbs: gtk::Box,
     frame: gtk::Box,
     entry: gtk::Entry,
+    pane: RefCell<Weak<Pane>>,
 }
 
 const MAX_CRUMBS: usize = 7;
@@ -42,10 +46,11 @@ impl Pathbar {
         entry.set_placeholder_text(Some("Path or URI: ~/Projects, /mnt/games, smb://host/share"));
         widget.add_named(&frame, Some("crumbs"));
         widget.add_named(&entry, Some("entry"));
-        Pathbar { widget, crumbs, frame, entry }
+        Pathbar { widget, crumbs, frame, entry, pane: RefCell::new(Weak::new()) }
     }
 
     pub fn connect(&self, w: &Rc<Pane>) {
+        *self.pane.borrow_mut() = Rc::downgrade(w);
         let click = gtk::GestureClick::new();
         let weak = Rc::downgrade(w);
         click.connect_released(move |g, _, x, y| {
@@ -177,6 +182,31 @@ impl Pathbar {
             b.connect_clicked(move |b| {
                 let _ = b.activate_action("win.goto-uri", Some(&uri.to_variant()));
             });
+            // files dropped on a part of the path go there
+            let drop = files::file_drop_target();
+            let bw = b.downgrade();
+            drop.connect_enter(move |_, _, _| {
+                if let Some(b) = bw.upgrade() {
+                    b.add_css_class("drop-into");
+                }
+                gdk::DragAction::COPY | gdk::DragAction::MOVE
+            });
+            let bw = b.downgrade();
+            drop.connect_leave(move |_| {
+                if let Some(b) = bw.upgrade() {
+                    b.remove_css_class("drop-into");
+                }
+            });
+            let (weak, dest, bw) = (self.pane.borrow().clone(), f.clone(), b.downgrade());
+            drop.connect_drop(move |d, v, _, _| {
+                if let Some(b) = bw.upgrade() {
+                    b.remove_css_class("drop-into");
+                }
+                let (Some(w), Ok(list)) = (weak.upgrade().and_then(|p| p.win()), v.get::<gdk::FileList>()) else { return false };
+                w.transfer(list.files(), dest.clone(), files::drop_mode(d.current_event_state()));
+                true
+            });
+            b.add_controller(drop);
             self.crumbs.append(&b);
         }
     }

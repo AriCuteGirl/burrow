@@ -6,6 +6,7 @@ mod keys;
 mod net;
 mod ops;
 mod rename;
+mod rubber;
 mod search;
 mod share;
 mod theme;

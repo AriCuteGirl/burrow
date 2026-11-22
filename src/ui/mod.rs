@@ -1720,7 +1720,11 @@ impl Win {
     pub fn transfer(self: &Rc<Self>, sources: Vec<gio::File>, dest: gio::File, mode: crate::transfer::Mode) {
         use crate::transfer::Mode;
         // dropping something onto itself does nothing
-        let sources: Vec<gio::File> = sources.into_iter().filter(|s| !s.equal(&dest)).collect();
+        let mut sources: Vec<gio::File> = sources.into_iter().filter(|s| !s.equal(&dest)).collect();
+        // neither does moving things into the folder they're already in
+        if mode != Mode::Copy {
+            sources.retain(|s| !s.has_parent(Some(&dest)));
+        }
         if sources.is_empty() {
             return;
         }

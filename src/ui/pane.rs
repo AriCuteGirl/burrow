@@ -90,7 +90,7 @@ impl Pane {
         let files = Files::new(&w.cfg.borrow());
         let drives_page = DrivesPage::new();
         let network_page = Rc::new(NetworkPage::new());
-        content.add_named(&files.widget, Some("files"));
+        content.add_named(&files.outer, Some("files"));
         content.add_named(&drives_page.widget, Some("drives"));
         content.add_named(&network_page.widget, Some("network"));
         widget.append(&content);
@@ -115,6 +115,16 @@ impl Pane {
             fwd_btn,
             up_btn,
         });
+        // files dropped on the up button go to the parent folder
+        let drop = files::file_drop_target();
+        let weak = Rc::downgrade(&p);
+        drop.connect_drop(move |d, v, _, _| {
+            let (Some(p), Ok(list)) = (weak.upgrade(), v.get::<gdk::FileList>()) else { return false };
+            let (Some(w), Some(dest)) = (p.win(), p.current_file().and_then(|f| f.parent())) else { return false };
+            w.transfer(list.files(), dest, files::drop_mode(d.current_event_state()));
+            true
+        });
+        p.up_btn.add_controller(drop);
         p.files.connect(&p);
         p.pathbar.connect(&p);
         let weak = Rc::downgrade(&p);

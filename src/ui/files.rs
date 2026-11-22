@@ -5,6 +5,7 @@
 use super::dirmodel::DirModel;
 use super::pane::Pane;
 use crate::config::Config;
+use crate::rubber::Rubber;
 use crate::search::{self, Query, Shared};
 use crate::thumbs::{self, Size};
 use crate::util;
@@ -71,6 +72,18 @@ impl SortKey {
     }
 }
 
+/// A selection rectangle being drawn.
+struct Band {
+    rubber: Rubber,
+    /// Where it started, in the coordinates of the scrolled contents
+    from: (f64, f64),
+    /// The pointer, in the coordinates of the file area
+    to: (f64, f64),
+    n: u32,
+    scroll: (f64, f64),
+    tick: Option<gtk::TickCallbackId>,
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Hit {
     Thing,
@@ -86,10 +99,16 @@ struct Look {
     icon_size: Cell<i32>,
     thumbnails: Cell<bool>,
     searching: Cell<bool>,
+    /// Every tile that exists, to find which ones a selection rectangle touches
+    cells: RefCell<Vec<(glib::WeakRef<gtk::Widget>, glib::WeakRef<gtk::ListItem>)>>,
 }
 
 pub struct Files {
     pub widget: gtk::Stack,
+    /// The stack with the selection rectangle drawn over it
+    pub outer: gtk::Overlay,
+    band: gtk::Box,
+    rubber: RefCell<Option<Band>>,
     dir: Rc<DirModel>,
     filtered: gtk::FilterListModel,
     sorted: gtk::SortListModel,
@@ -208,17 +227,14 @@ impl Files {
         let grid = gtk::GridView::new(Some(selection.clone()), Some(grid_factory(&look, &pane)));
         grid.add_css_class("files");
         grid.set_max_columns(64);
-        grid.set_enable_rubberband(true);
         // ---------------- compact
         let compact = gtk::GridView::new(Some(selection.clone()), Some(compact_factory(&look, &pane)));
         compact.add_css_class("files");
         compact.add_css_class("compact");
         compact.set_max_columns(64);
-        compact.set_enable_rubberband(true);
         // ---------------- list
         let list = gtk::ColumnView::new(Some(selection.clone()));
         list.add_css_class("files");
-        list.set_enable_rubberband(true);
         list.set_show_row_separators(false);
         list.set_reorderable(false);
         for (id, title, expand, width) in
@@ -304,8 +320,22 @@ impl Files {
         conn.append(&stop);
         widget.add_named(&conn, Some("connecting"));
 
+        let band = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        band.add_css_class("band");
+        band.set_halign(gtk::Align::Start);
+        band.set_valign(gtk::Align::Start);
+        band.set_can_target(false);
+        band.set_visible(false);
+        let outer = gtk::Overlay::new();
+        outer.set_child(Some(&widget));
+        outer.add_overlay(&band);
+        outer.set_clip_overlay(&band, true);
+
         let f = Files {
             widget,
+            outer,
+            band,
+            rubber: RefCell::new(None),
             dir,
             filtered,
             sorted,
@@ -461,6 +491,20 @@ impl Files {
                     }
                     return glib::Propagation::Stop;
                 }
+                // nothing in the list has the focus yet: the arrows start at the first file
+                let arrow = match key {
+                    gdk::Key::Left => Some((-1, 0)),
+                    gdk::Key::Right => Some((1, 0)),
+                    gdk::Key::Up => Some((0, -1)),
+                    gdk::Key::Down => Some((0, 1)),
+                    _ => None,
+                };
+                if let Some((dx, dy)) = arrow {
+                    if mods.is_empty() && gtk::prelude::RootExt::focus(&w.window).is_some_and(|f| f == *p.files.widget.upcast_ref::<gtk::Widget>()) {
+                        p.files.move_cursor(dx, dy);
+                        return glib::Propagation::Stop;
+                    }
+                }
                 let plain = !mods.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK);
                 if let Some(c) = key.to_unicode().filter(|c| plain && !c.is_control() && !c.is_whitespace()) {
                     if w.cfg.borrow().view.vim_keys {
@@ -497,21 +541,43 @@ impl Files {
             });
             view.add_controller(click);
 
-            // The views' own rubberband takes every drag, also ones that start on a file, so
-            // drag and drop never got a chance. Decide before they see the press: on a file
-            // no rubberband, on empty space yes.
-            let press = gtk::GestureClick::new();
-            press.set_propagation_phase(gtk::PropagationPhase::Capture);
+            // Selection rectangle. GTK's own one selects only on release, and it grabs drags that
+            // start on a file too, so this is ours: only from empty space, and live.
+            let drag = gtk::GestureDrag::new();
             let weak = Rc::downgrade(pane);
-            press.connect_pressed(move |_, _, x, y| {
-                if let Some(p) = weak.upgrade() {
-                    let on = p.files.hit(x, y) == Hit::Empty;
-                    p.files.grid.set_enable_rubberband(on);
-                    p.files.compact.set_enable_rubberband(on);
-                    p.files.list.set_enable_rubberband(on);
+            drag.connect_drag_begin(move |g, x, y| {
+                let ok = weak.upgrade().is_some_and(|p| p.files.showing_view() && p.files.hit(x, y) == Hit::Empty);
+                if !ok {
+                    g.set_state(gtk::EventSequenceState::Denied);
                 }
             });
-            view.add_controller(press);
+            let weak = Rc::downgrade(pane);
+            drag.connect_drag_update(move |g, dx, dy| {
+                let (Some(p), Some((x, y))) = (weak.upgrade(), g.start_point()) else { return };
+                let f = &p.files;
+                if f.rubber.borrow().is_none() {
+                    if dx.hypot(dy) < 5.0 {
+                        return;
+                    }
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                    let adding = g.current_event_state().intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
+                    f.band_start(&p, x, y, adding);
+                }
+                f.band_to(x + dx, y + dy);
+            });
+            let weak = Rc::downgrade(pane);
+            drag.connect_drag_end(move |_, _, _| {
+                if let Some(p) = weak.upgrade() {
+                    p.files.band_stop();
+                }
+            });
+            let weak = Rc::downgrade(pane);
+            drag.connect_cancel(move |_, _| {
+                if let Some(p) = weak.upgrade() {
+                    p.files.band_stop();
+                }
+            });
+            view.add_controller(drag);
 
             // a left click on empty space unselects, and gives the area focus (for Ctrl+V etc.)
             let empty = gtk::GestureClick::new();
@@ -527,11 +593,142 @@ impl Files {
                 if !adding && f.hit(x, y) == Hit::Empty {
                     f.selection.unselect_all();
                     f.cursor.set(None);
-                    f.grab_focus();
+                    f.focus_area(&p);
                 }
             });
             view.add_controller(empty);
         }
+    }
+
+    /// Keyboard focus for the file area without scrolling to the focused file.
+    fn focus_area(&self, p: &Pane) {
+        let inside = p.win().and_then(|w| gtk::prelude::RootExt::focus(&w.window)).is_some_and(|f| f.is_ancestor(&self.widget));
+        if !inside {
+            self.widget.grab_focus();
+        }
+    }
+
+    // ---------------------------------------------------------------- selection rectangle
+    fn scroller(&self) -> Option<gtk::ScrolledWindow> {
+        self.widget.visible_child().and_downcast::<gtk::ScrolledWindow>()
+    }
+
+    fn scroll_pos(&self) -> (f64, f64) {
+        self.scroller().map(|s| (s.hadjustment().value(), s.vadjustment().value())).unwrap_or_default()
+    }
+
+    fn band_start(&self, p: &Rc<Pane>, x: f64, y: f64, adding: bool) {
+        let mut base = vec![];
+        if adding {
+            let sel = self.selection.selection();
+            if let Some((iter, first)) = gtk::BitsetIter::init_first(&sel) {
+                base.extend(std::iter::once(first).chain(iter));
+            }
+        }
+        self.focus_area(p);
+        let scroll = self.scroll_pos();
+        // scrolls at the edges, and follows the mouse wheel
+        let weak = Rc::downgrade(p);
+        let tick = self.widget.add_tick_callback(move |_, _| {
+            let Some(p) = weak.upgrade() else { return glib::ControlFlow::Break };
+            p.files.band_tick();
+            glib::ControlFlow::Continue
+        });
+        *self.rubber.borrow_mut() = Some(Band {
+            rubber: Rubber::new(base),
+            from: (x + scroll.0, y + scroll.1),
+            to: (x, y),
+            n: self.selection.n_items(),
+            scroll,
+            tick: Some(tick),
+        });
+        self.band.set_visible(true);
+    }
+
+    fn band_to(&self, x: f64, y: f64) {
+        if let Some(b) = self.rubber.borrow_mut().as_mut() {
+            b.to = (x, y);
+        }
+        self.band_update();
+    }
+
+    fn band_tick(&self) {
+        let Some((to, scroll)) = self.rubber.borrow().as_ref().map(|b| (b.to, b.scroll)) else { return };
+        if let Some(s) = self.scroller() {
+            let (h, edge) = (self.widget.height() as f64, 36.0);
+            // further past the edge = faster
+            let push = if to.1 < edge { to.1 - edge } else if to.1 > h - edge { to.1 - (h - edge) } else { 0.0 };
+            if push != 0.0 {
+                let a = s.vadjustment();
+                a.set_value(a.value() + (push * 0.35).clamp(-40.0, 40.0));
+            }
+        }
+        if self.scroll_pos() != scroll {
+            self.band_update();
+        }
+    }
+
+    fn band_update(&self) {
+        let scroll = self.scroll_pos();
+        let n = self.selection.n_items();
+        let wanted = {
+            let mut slot = self.rubber.borrow_mut();
+            let Some(b) = slot.as_mut() else { return };
+            if b.n != n {
+                // files came or went: positions moved
+                b.rubber.forget();
+                b.n = n;
+            }
+            b.scroll = scroll;
+            let (x0, y0) = (b.from.0 - scroll.0, b.from.1 - scroll.1);
+            let (l, t) = (x0.min(b.to.0), y0.min(b.to.1));
+            let (w, h) = ((x0 - b.to.0).abs().max(1.0), (y0 - b.to.1).abs().max(1.0));
+            // draw only the part on screen
+            let (aw, ah) = (self.widget.width() as f64, self.widget.height() as f64);
+            let (dl, dt) = (l.max(0.0), t.max(0.0));
+            let (dr, db) = ((l + w).min(aw), (t + h).min(ah));
+            self.band.set_margin_start(dl as i32);
+            self.band.set_margin_top(dt as i32);
+            self.band.set_size_request((dr - dl).max(1.0) as i32, (db - dt).max(1.0) as i32);
+            let rect = gtk::graphene::Rect::new(l as f32, t as f32, w as f32, h as f32);
+            let mut cells = self.look.cells.borrow_mut();
+            cells.retain(|(c, li)| c.upgrade().is_some() && li.upgrade().is_some());
+            let seen: Vec<(u32, bool)> = cells
+                .iter()
+                .filter_map(|(c, li)| {
+                    let (c, li) = (c.upgrade()?, li.upgrade()?);
+                    if !c.is_mapped() || li.position() == gtk::INVALID_LIST_POSITION {
+                        return None;
+                    }
+                    let bounds = c.compute_bounds(&self.widget)?;
+                    Some((li.position(), bounds.intersection(&rect).is_some()))
+                })
+                .collect();
+            // a list row has several cells: touching any of them counts
+            let mut by_pos: HashMap<u32, bool> = HashMap::new();
+            for (p, hit) in seen {
+                *by_pos.entry(p).or_default() |= hit;
+            }
+            b.rubber.see(by_pos);
+            b.rubber.selected(self.columns_now(), n)
+        };
+        let set = gtk::Bitset::new_empty();
+        for p in &wanted {
+            set.add(*p);
+        }
+        if set != self.selection.selection() {
+            self.selection.set_selection(&set, &gtk::Bitset::new_range(0, n));
+        }
+    }
+
+    fn band_stop(&self) {
+        let b = self.rubber.borrow_mut().take();
+        if let Some(mut b) = b {
+            if let Some(t) = b.tick.take() {
+                t.remove();
+            }
+        }
+        self.band.set_visible(false);
     }
 
     /// What's under the pointer (coordinates of the whole file area).
@@ -1027,6 +1224,9 @@ fn item_icon(info: &gio::FileInfo, look: &Look) -> gio::Icon {
 fn attach_cell(w: &gtk::Widget, li: &gtk::ListItem, pane: &Rc<RefCell<Weak<Pane>>>) {
     // the cell carries the tile's padding, so its edges can be grabbed too
     w.add_css_class("cell");
+    if let Some(p) = pane.borrow().upgrade() {
+        p.files.look.cells.borrow_mut().push((w.downgrade(), li.downgrade()));
+    }
     let click = gtk::GestureClick::new();
     click.set_button(0);
     let (liw, pw) = (li.downgrade(), pane.clone());
@@ -1111,7 +1311,7 @@ fn attach_cell(w: &gtk::Widget, li: &gtk::ListItem, pane: &Rc<RefCell<Weak<Pane>
     w.add_controller(drop);
 }
 
-fn file_drop_target() -> gtk::DropTarget {
+pub(super) fn file_drop_target() -> gtk::DropTarget {
     let d = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY | gdk::DragAction::MOVE);
     d.set_preload(true);
     d

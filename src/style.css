@@ -390,7 +390,8 @@ columnview.files > listview > row > cell { padding: 0; }
 columnview.files .cell { padding: 3px 10px; }
 .file-meta { font-size: 12px; color: @text_faint; }
 columnview.files > listview > row:selected .file-meta { color: @text_dim; }
-rubberband { background: alpha(@accent, 0.18); border: 1px solid @crimson; }
+.band { background: alpha(@accent, 0.18); border: 1px solid @crimson; }
+.crumb.drop-into, .toolbar > button:drop(active) { background: @sel_bg; color: @text; box-shadow: inset 0 0 0 2px @accent_hot; }
 
 /* ---------------- sidebar drag and drop ---------------- */
 .side-list row.drop-before { box-shadow: inset 0 2px 0 0 @accent_hot; }
