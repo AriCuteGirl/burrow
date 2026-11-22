@@ -450,11 +450,13 @@ impl Pane {
         let uri = f.uri().to_string();
         let is_dir = files::is_folder(first);
         let menu = gio::Menu::new();
+        // rarely used entries, so the menu itself stays short
+        let more = gio::Menu::new();
         let open = gio::Menu::new();
         open.append(Some("Open"), Some(&action("win.open-uri", &uri)));
         if is_dir && sel.len() == 1 {
             open.append(Some("Open in new tab"), Some(&action("win.open-tab", &uri)));
-            open.append(Some("Open in split view"), Some(&action("win.open-split", &uri)));
+            more.append(Some("Open in split view"), Some(&action("win.open-split", &uri)));
         }
         if !is_dir && !self.in_trash() {
             if let Some(ct) = first.content_type() {
@@ -476,7 +478,7 @@ impl Pane {
             }
         }
         if is_dir && sel.len() == 1 && f.is_native() {
-            open.append(Some("Open terminal here"), Some(&action("win.terminal", &uri)));
+            more.append(Some("Open terminal here"), Some(&action("win.terminal", &uri)));
         }
         menu.append_section(None, &open);
         if !self.in_trash() && f.is_native() {
@@ -489,21 +491,20 @@ impl Pane {
             arc.append(Some("Compress…"), Some("win.compress"));
             menu.append_section(None, &arc);
         }
+        let side = gio::Menu::new();
         if is_dir && sel.len() == 1 {
-            let side = gio::Menu::new();
             let pin = gio::Menu::new();
             for s in w.cfg.borrow().sections.iter() {
                 pin.append(Some(&s.name), Some(&format!("win.pin(('{}','{}'))", esc(&uri), esc(&s.id))));
             }
             side.append_submenu(Some("Pin to sidebar"), &pin);
             if f.is_native() && !self.in_trash() {
-                side.append(Some("Share on the network…"), Some(&action("win.share", &uri)));
+                more.append(Some("Share on the network…"), Some(&action("win.share", &uri)));
             }
-            side.append(Some("Change folder icon…"), Some(&action("win.folder-icon", &uri)));
+            more.append(Some("Change folder icon…"), Some(&action("win.folder-icon", &uri)));
             if w.cfg.borrow().folders.get(&files::folder_key(&f)).is_some_and(|c| c.icon.is_some()) {
-                side.append(Some("Reset folder icon"), Some(&action("win.folder-icon-reset", &uri)));
+                more.append(Some("Reset folder icon"), Some(&action("win.folder-icon-reset", &uri)));
             }
-            menu.append_section(None, &side);
         }
         let edit = gio::Menu::new();
         if !self.in_trash() {
@@ -517,13 +518,12 @@ impl Pane {
             edit.append(Some(if sel.len() > 1 { "Rename all…" } else { "Rename…" }), Some("win.rename"));
         }
         menu.append_section(None, &edit);
-        let misc = gio::Menu::new();
         if sel.len() == 1 && f.is_native() && !self.in_trash() {
-            misc.append(Some("Create shortcut…"), Some(&action("win.shortcut", &uri)));
+            more.append(Some("Create shortcut…"), Some(&action("win.shortcut", &uri)));
         }
-        misc.append(Some("Copy path"), Some(&action("win.copy-path", &uri)));
-        misc.append(Some("Properties"), Some("win.properties"));
-        menu.append_section(None, &misc);
+        more.append(Some("Copy path"), Some(&action("win.copy-path", &uri)));
+        side.append_submenu(Some("More"), &more);
+        menu.append_section(None, &side);
         let danger = gio::Menu::new();
         if self.in_trash() {
             danger.append(Some("Restore"), Some("win.restore"));
@@ -533,6 +533,9 @@ impl Pane {
             danger.append(Some("Delete for good…"), Some("win.delete"));
         }
         menu.append_section(None, &danger);
+        let props = gio::Menu::new();
+        props.append(Some("Properties"), Some("win.properties"));
+        menu.append_section(None, &props);
         popup_menu(at, &menu, x, y);
     }
 

@@ -213,7 +213,7 @@ impl Reach {
             parts.push(format!("Samba only listens on {i}"));
         }
         if let Some(h) = &self.hosts_allow {
-            parts.push(format!("only these addresses may connect: {h}"));
+            parts.push(format!("only these addresses may connect: {}", h.trim_end_matches('.')));
         }
         (!parts.is_empty()).then(|| format!("Your smb.conf limits who can reach shares: {}. Other devices won't see this folder.", parts.join(", and ")))
     }

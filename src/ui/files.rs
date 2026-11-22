@@ -1083,7 +1083,7 @@ fn set_hidden_class(w: &gtk::Widget, info: &gio::FileInfo) {
 /// "folder-documents" -> "folder-carmine-documents" (else "folder-carmine"), if the icon theme has it.
 /// GTK searches a child theme fully before its parents, so a list of names with fallbacks
 /// would pick the child's plain "folder"; resolve the coloured name ourselves instead.
-fn tint_folder(icon: &gio::Icon, color: &str) -> gio::Icon {
+pub(super) fn tint_folder(icon: &gio::Icon, color: &str) -> gio::Icon {
     let Some(t) = icon.downcast_ref::<gio::ThemedIcon>() else { return icon.clone() };
     let Some(theme) = gdk::Display::default().map(|d| gtk::IconTheme::for_display(&d)) else { return icon.clone() };
     let mut candidates = vec![];

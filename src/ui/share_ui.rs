@@ -60,6 +60,8 @@ fn close_button(root: &gtk::Box, win: &gtk::Window, label: &str) {
     let b = gtk::Button::with_label(label);
     b.add_css_class("secondary");
     b.set_halign(gtk::Align::End);
+    // otherwise the first copyable text gets the focus and shows up selected
+    gtk::prelude::GtkWindowExt::set_focus(win, Some(&b));
     let ww = win.downgrade();
     b.connect_clicked(move |_| {
         if let Some(w) = ww.upgrade() {

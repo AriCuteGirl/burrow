@@ -125,10 +125,13 @@ impl Win {
                         return;
                     }
                 };
-                if let Some(ic) = info.icon() {
-                    icon2.set_from_gicon(&ic);
-                }
                 let is_dir = info.file_type() == gio::FileType::Directory;
+                if let Some(ic) = info.icon() {
+                    match w.folder_color().filter(|_| is_dir) {
+                        Some(c) => icon2.set_from_gicon(&super::files::tint_folder(&ic, &c)),
+                        None => icon2.set_from_gicon(&ic),
+                    }
+                }
                 let ctype = info.content_type().map(|c| c.to_string()).unwrap_or_default();
                 let desc = if is_dir { "Folder".to_string() } else { format!("{} ({ctype})", gio::content_type_get_description(&ctype)) };
                 add2("Type", value_label(&desc).upcast_ref());
@@ -205,6 +208,7 @@ impl Win {
             glib::Propagation::Proceed
         });
         win.add_controller(keys);
+        gtk::prelude::GtkWindowExt::set_focus(&win, Some(&close));
         win.present();
     }
 }

@@ -507,3 +507,8 @@ checkbutton { color: @text_dim; }
 entry:focus-within, passwordentry:focus-within, searchentry:focus-within, spinbutton:focus-within, text:focus-within {
   outline-color: alpha(@accent_hot, 0.85);
 }
+label > selection, label selection { background: @wine; color: @text; }
+/* lists outside the sidebar (batch rename preview, app chooser) */
+list.side-list, .dialog-root list, .dialog-root scrolledwindow, .dialog-root viewport { background: transparent; }
+.dialog-root list > row { background: transparent; border-radius: $R_SMALL; }
+.settings-group list.side-list { padding: 6px 8px; }
