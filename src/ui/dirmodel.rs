@@ -10,7 +10,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
-const BATCH: i32 = 256;
+const BATCH: i32 = 1024;
+/// Collect entries this long before showing them: sorting one big batch is far cheaper
+/// than re-sorting for every small one, and fast folders appear in one go.
+const GATHER: std::time::Duration = std::time::Duration::from_millis(350);
 
 pub struct DirModel {
     pub store: gio::ListStore,
@@ -116,6 +119,8 @@ impl DirModel {
                     return;
                 }
             };
+            let mut pending: Vec<gio::FileInfo> = vec![];
+            let mut since = std::time::Instant::now();
             loop {
                 let batch = en.next_files_future(BATCH, glib::Priority::DEFAULT).await;
                 let Some(me) = weak.upgrade() else { return };
@@ -136,7 +141,12 @@ impl DirModel {
                                 i
                             })
                             .collect();
-                        me.store.splice(me.store.n_items(), 0, &items);
+                        pending.extend(items);
+                        if since.elapsed() >= GATHER {
+                            me.store.splice(me.store.n_items(), 0, &pending);
+                            pending.clear();
+                            since = std::time::Instant::now();
+                        }
                     }
                     Err(e) => {
                         *me.error.borrow_mut() = Some(e);
@@ -146,11 +156,35 @@ impl DirModel {
             }
             if let Some(me) = weak.upgrade() {
                 if !cancel.is_cancelled() {
+                    // a watcher event may have replaced an entry's name meanwhile: keep ours
+                    me.store.splice(me.store.n_items(), 0, &pending);
                     me.loading.set(false);
                     me.state_changed();
                 }
             }
         });
+    }
+
+    /// Search results instead of the folder's own contents: stop listing and watching.
+    pub fn begin_results(&self) -> gio::Cancellable {
+        self.cancel.borrow().cancel();
+        *self.cancel.borrow_mut() = gio::Cancellable::new();
+        *self.monitor.borrow_mut() = None;
+        *self.error.borrow_mut() = None;
+        self.store.remove_all();
+        self.names.borrow_mut().clear();
+        self.loading.set(true);
+        self.state_changed();
+        self.cancel.borrow().clone()
+    }
+
+    pub fn end_results(&self) {
+        self.loading.set(false);
+        self.state_changed();
+    }
+
+    pub fn attrs(&self) -> &'static str {
+        self.attrs
     }
 
     /// Show an error that happened outside listing (e.g. connecting failed).

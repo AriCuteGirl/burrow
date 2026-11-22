@@ -327,8 +327,8 @@ button.tab-close {
   border-radius: $R_SMALL;
 }
 button.tab-close:hover { background: @surface_alt; color: @text; }
-.topbar > button, .topbar > togglebutton, .topbar > menubutton > button,
-.segmented > togglebutton {
+.topbar > button, .topbar > button.toggle, .topbar > menubutton > button,
+.segmented > button.toggle {
   margin-bottom: 6px;
 }
 .segmented {
@@ -337,8 +337,8 @@ button.tab-close:hover { background: @surface_alt; color: @text; }
   border-radius: $R_SMALL;
   padding: 1px;
 }
-.segmented > togglebutton { margin: 0; border-radius: $R_SMALL; }
-togglebutton.flat-btn, menubutton.flat-btn > button {
+.segmented > button.toggle { margin: 0; border-radius: $R_SMALL; }
+button.toggle.flat-btn, menubutton.flat-btn > button {
   background: transparent;
   border: 1px solid transparent;
   box-shadow: none;
@@ -348,9 +348,9 @@ togglebutton.flat-btn, menubutton.flat-btn > button {
   padding: 0;
   border-radius: $R_SMALL;
 }
-togglebutton.flat-btn:hover, menubutton.flat-btn > button:hover { background: @surface_alt; color: @text; }
-togglebutton.flat-btn:checked { background: @sel_bg; color: @text; border-color: @crimson; }
-togglebutton.flat-btn:disabled { opacity: 0.35; }
+button.toggle.flat-btn:hover, menubutton.flat-btn > button:hover { background: @surface_alt; color: @text; }
+button.toggle.flat-btn:checked { background: @sel_bg; color: @text; border-color: @crimson; }
+button.toggle.flat-btn:disabled { opacity: 0.35; }
 
 /* ---------------- panes ---------------- */
 .pane { border-top: 2px solid transparent; }
@@ -512,3 +512,9 @@ label > selection, label selection { background: @wine; color: @text; }
 list.side-list, .dialog-root list, .dialog-root scrolledwindow, .dialog-root viewport { background: transparent; }
 .dialog-root list > row { background: transparent; border-radius: $R_SMALL; }
 .settings-group list.side-list { padding: 6px 8px; }
+
+/* ---------------- phase 4: preview, quick look ---------------- */
+.preview { padding: 14px; border-left: 1px solid @wine; background: @side_bg; }
+.dialog-root > .preview { border-left: none; background: transparent; padding: 0; }
+.preview-text { background: @bg_deep; border: 1px solid @wine; border-radius: $R_SMALL; }
+.preview-text textview, .preview-text textview > text { background: transparent; color: @text; font-family: monospace; font-size: 12px; }

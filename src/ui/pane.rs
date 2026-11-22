@@ -397,6 +397,43 @@ impl Pane {
         }
     }
 
+    pub fn selection_changed(&self) {
+        if let Some(w) = self.win() {
+            if w.is_active(self) {
+                w.refresh_preview();
+            }
+        }
+    }
+
+    pub fn move_cursor(&self, dx: i32, dy: i32) {
+        self.files.move_cursor(dx, dy);
+    }
+
+    /// Open everything selected: folders in tabs (the first one here), files in their apps.
+    pub fn open_selected(self: &Rc<Self>) {
+        let Some(w) = self.win() else { return };
+        let sel = self.files.selected_infos();
+        if sel.len() > 20 {
+            w.show_notice("That's a lot to open at once: select 20 or fewer", true);
+            return;
+        }
+        let mut here = sel.len() == 1;
+        for info in &sel {
+            let Some(f) = files::open_target(info) else { continue };
+            if files::is_folder(info) {
+                let f = symlink_target(info, &f).unwrap_or(f);
+                if here {
+                    self.go(Loc::Files(f), true);
+                } else {
+                    w.new_tab(Loc::Files(f), false);
+                }
+                here = false;
+            } else {
+                w.launch(&f);
+            }
+        }
+    }
+
     pub fn start_filter(&self, c: char) {
         if let Some(w) = self.win() {
             w.filter_entry.grab_focus();
@@ -453,7 +490,12 @@ impl Pane {
         // rarely used entries, so the menu itself stays short
         let more = gio::Menu::new();
         let open = gio::Menu::new();
-        open.append(Some("Open"), Some(&action("win.open-uri", &uri)));
+        open.append(Some("Open"), Some("win.open-selected"));
+        if sel.len() == 1 && self.files.is_searching() {
+            if let Some(p) = f.parent() {
+                open.append(Some("Open its folder"), Some(&action("win.goto-uri", &p.uri())));
+            }
+        }
         if is_dir && sel.len() == 1 {
             open.append(Some("Open in new tab"), Some(&action("win.open-tab", &uri)));
             more.append(Some("Open in split view"), Some(&action("win.open-split", &uri)));
@@ -522,6 +564,19 @@ impl Pane {
             more.append(Some("Create shortcut…"), Some(&action("win.shortcut", &uri)));
         }
         more.append(Some("Copy path"), Some(&action("win.copy-path", &uri)));
+        // own actions that fit everything selected
+        if !self.in_trash() {
+            let targets = w.targets();
+            let own = gio::Menu::new();
+            for (i, a) in w.cfg.borrow().actions.iter().enumerate() {
+                if a.applies(&targets) {
+                    own.append(Some(&a.name), Some(&action("win.custom", &i.to_string())));
+                }
+            }
+            if own.n_items() > 0 {
+                side.append_submenu(Some("Actions"), &own);
+            }
+        }
         side.append_submenu(Some("More"), &more);
         menu.append_section(None, &side);
         let danger = gio::Menu::new();

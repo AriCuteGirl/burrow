@@ -9,15 +9,18 @@ mod create;
 mod dialogs;
 mod dirmodel;
 mod drives_page;
+mod extras;
 mod files;
 mod jobs;
 mod network_page;
 mod pane;
 mod pathbar;
+mod preview;
 mod properties;
 mod settings;
 mod share_ui;
 mod sidebar;
+mod thumbq;
 
 use crate::config::{self, Config, Item};
 use crate::drives::{self, Drive};
@@ -95,6 +98,13 @@ pub struct Win {
     split_btn: gtk::ToggleButton,
     mode_btns: [gtk::ToggleButton; 3],
     pub filter_entry: gtk::SearchEntry,
+    search_btn: gtk::ToggleButton,
+    preview_btn: gtk::ToggleButton,
+    pub preview: preview::Preview,
+    pub preview_rev: gtk::Revealer,
+    pub preview_turn: Cell<u64>,
+    pub quick_look: preview::QuickLookSlot,
+    pub view_keys: RefCell<Vec<(gdk::Key, gdk::ModifierType, &'static str)>>,
     status: gtk::Label,
     notice: gtk::Label,
     pub jobs: jobs::Jobs,
@@ -234,6 +244,8 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     paned.set_position(270);
     paned.set_shrink_start_child(false);
     paned.set_resize_start_child(false);
+    // never clip the content: the window gets a sensible minimum width instead
+    paned.set_shrink_end_child(false);
     root.append(&paned);
 
     let sidebar = sidebar::Sidebar::new();
@@ -264,8 +276,12 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     let filter_entry = gtk::SearchEntry::new();
     filter_entry.add_css_class("filter-entry");
     filter_entry.set_placeholder_text(Some("Filter"));
-    filter_entry.set_width_chars(14);
+    filter_entry.set_width_chars(8);
+    filter_entry.set_max_width_chars(16);
     topbar.append(&filter_entry);
+    let search_btn = toggle_btn("edit-find-symbolic", "Search in subfolders too");
+    search_btn.add_css_class("flat-btn");
+    topbar.append(&search_btn);
     let modes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     modes.add_css_class("segmented");
     let grid_b = toggle_btn("view-grid-symbolic", "Grid (Ctrl+1)");
@@ -284,6 +300,9 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     let split_btn = toggle_btn("view-dual-symbolic", "Split view (F3)");
     split_btn.add_css_class("flat-btn");
     topbar.append(&split_btn);
+    let preview_btn = toggle_btn("sidebar-show-right-symbolic", "Preview pane");
+    preview_btn.add_css_class("flat-btn");
+    topbar.append(&preview_btn);
     let menu = gio::Menu::new();
     menu.append(Some("Connect to server…"), Some("win.connect"));
     menu.append(Some("Settings"), Some("win.settings"));
@@ -301,7 +320,16 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
 
     let tab_stack = gtk::Stack::new();
     tab_stack.set_vexpand(true);
-    main.append(&tab_stack);
+    tab_stack.set_hexpand(true);
+    let preview = preview::Preview::new(false);
+    preview.widget.set_size_request(260, -1);
+    let preview_rev = gtk::Revealer::new();
+    preview_rev.set_transition_type(gtk::RevealerTransitionType::SlideLeft);
+    preview_rev.set_child(Some(&preview.widget));
+    let middle = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    middle.append(&tab_stack);
+    middle.append(&preview_rev);
+    main.append(&middle);
 
     // status bar
     let statusbar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -346,6 +374,13 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
         split_btn,
         mode_btns: [grid_b, compact_b, list_b],
         filter_entry,
+        search_btn,
+        preview_btn,
+        preview,
+        preview_rev,
+        preview_turn: Cell::new(0),
+        quick_look: RefCell::default(),
+        view_keys: RefCell::default(),
         status,
         notice,
         jobs,
@@ -360,6 +395,9 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     w.apply_theme();
     w.connect_toolbar();
     w.install_actions();
+    w.apply_keys();
+    w.preview_rev.set_reveal_child(w.cfg.borrow().view.preview_pane);
+    w.preview_btn.set_active(w.cfg.borrow().view.preview_pane);
     w.watch_drives();
     w.watch_rice();
     w.watch_config();
@@ -424,7 +462,7 @@ impl Win {
         self.tabs.borrow().iter().flat_map(|t| t.panes.borrow().clone()).collect()
     }
 
-    fn is_active(&self, p: &Pane) -> bool {
+    pub fn is_active(&self, p: &Pane) -> bool {
         !self.tabs.borrow().is_empty() && std::ptr::eq(Rc::as_ptr(&self.active()), p)
     }
 
@@ -618,13 +656,16 @@ impl Win {
         }
         let p = tab.active_pane();
         self.syncing.set(true);
-        self.filter_entry.set_text(&p.files.filter_text());
+        let searching = p.files.search_mode.get();
+        self.search_btn.set_active(searching);
+        self.filter_entry.set_text(&if searching { p.files.query() } else { p.files.filter_text() });
         self.split_btn.set_active(split);
         self.syncing.set(false);
         self.sync_toolbar();
         self.sidebar.sync_selection(&p.loc.borrow());
         self.update_title();
         self.update_status();
+        self.refresh_preview();
     }
 
     /// Called by a pane after it navigated.
@@ -636,7 +677,9 @@ impl Win {
         if self.is_active(p) {
             self.syncing.set(true);
             self.filter_entry.set_text("");
+            self.search_btn.set_active(false);
             self.syncing.set(false);
+            self.refresh_preview();
             self.sync_toolbar();
             self.sidebar.sync_selection(&p.loc.borrow());
             self.update_title();
@@ -846,7 +889,11 @@ impl Win {
     /// Re-apply everything that depends on the config (after a file edit or a UI change).
     pub fn config_changed(self: &Rc<Self>) {
         self.apply_theme();
+        self.apply_keys();
         let cfg = self.cfg.borrow().clone();
+        self.preview_rev.set_reveal_child(cfg.view.preview_pane);
+        self.preview_btn.set_active(cfg.view.preview_pane);
+        self.refresh_preview();
         for p in self.all_panes() {
             p.files.config_changed(&cfg);
             p.drives_page.rebuild(self);
@@ -1045,6 +1092,32 @@ impl Win {
                 w.toggle_split();
             }
         });
+        let weak = Rc::downgrade(self);
+        self.search_btn.connect_toggled(move |b| {
+            let Some(w) = weak.upgrade() else { return };
+            if w.syncing.get() {
+                return;
+            }
+            let f = &w.active().files;
+            let text = w.filter_entry.text();
+            f.search_mode.set(b.is_active());
+            if b.is_active() {
+                f.set_filter("");
+                f.start_search(&text);
+            } else {
+                f.start_search("");
+                f.set_filter(&text);
+            }
+            w.filter_entry.grab_focus();
+        });
+        let weak = Rc::downgrade(self);
+        self.preview_btn.connect_toggled(move |b| {
+            let Some(w) = weak.upgrade() else { return };
+            let on = b.is_active();
+            if w.cfg.borrow().view.preview_pane != on {
+                w.edit_config(|c| c.view.preview_pane = on);
+            }
+        });
         for (i, b) in self.mode_btns.iter().enumerate() {
             let weak = Rc::downgrade(self);
             b.connect_toggled(move |b| {
@@ -1058,8 +1131,17 @@ impl Win {
         let weak = Rc::downgrade(self);
         self.filter_entry.connect_search_changed(move |e| {
             let Some(w) = weak.upgrade() else { return };
-            if !w.syncing.get() {
-                w.active().files.set_filter(&e.text());
+            if w.syncing.get() {
+                return;
+            }
+            let f = &w.active().files;
+            if f.search_mode.get() {
+                // (the entry reports changes late: ignore an echo of what's already shown)
+                if f.query() != e.text().as_str() {
+                    f.start_search(&e.text());
+                }
+            } else {
+                f.set_filter(&e.text());
             }
         });
         let weak = Rc::downgrade(self);
@@ -1077,9 +1159,18 @@ impl Win {
         });
     }
 
+    /// Search again in panes showing results (after files were moved, deleted, renamed…).
+    pub fn refresh_searches(&self) {
+        for p in self.all_panes() {
+            if p.files.is_searching() {
+                p.files.reload();
+            }
+        }
+    }
+
     fn install_actions(self: &Rc<Self>) {
         let app = self.window.application().expect("window has an app");
-        let add = |name: &str, accels: &[&str], f: Box<dyn Fn(&Rc<Win>)>| {
+        let add = |name: &str, f: Box<dyn Fn(&Rc<Win>)>| {
             let a = gio::SimpleAction::new(name, None);
             let weak = Rc::downgrade(self);
             a.connect_activate(move |_, _| {
@@ -1088,36 +1179,33 @@ impl Win {
                 }
             });
             self.window.add_action(&a);
-            if !accels.is_empty() {
-                app.set_accels_for_action(&format!("win.{name}"), accels);
-            }
         };
-        add("back", &["<Alt>Left", "<Alt>KP_Left", "Back"], Box::new(|w| w.active().go_back()));
-        add("forward", &["<Alt>Right", "<Alt>KP_Right", "Forward"], Box::new(|w| w.active().go_forward()));
-        add("up", &["<Alt>Up"], Box::new(|w| w.active().go_up()));
-        add("home", &["<Alt>Home"], Box::new(|w| w.go(Loc::Files(w.home.clone()), true)));
-        add("location", &["<Ctrl>l", "F6"], Box::new(|w| w.active().pathbar.start_editing()));
-        add("filter", &["<Ctrl>f"], Box::new(|w| {
+        add("back", Box::new(|w| w.active().go_back()));
+        add("forward", Box::new(|w| w.active().go_forward()));
+        add("up", Box::new(|w| w.active().go_up()));
+        add("home", Box::new(|w| w.go(Loc::Files(w.home.clone()), true)));
+        add("location", Box::new(|w| w.active().pathbar.start_editing()));
+        add("filter", Box::new(|w| {
             w.filter_entry.grab_focus();
         }));
-        add("hidden", &["<Ctrl>h"], Box::new(|w| w.hidden_btn.set_active(!w.hidden_btn.is_active())));
-        add("reload", &["F5", "<Ctrl>r"], Box::new(|w| {
+        add("hidden", Box::new(|w| w.hidden_btn.set_active(!w.hidden_btn.is_active())));
+        add("reload", Box::new(|w| {
             w.active().reload();
             w.reload_drives();
         }));
-        add("drives", &["<Ctrl>d"], Box::new(|w| w.go(Loc::Drives, true)));
-        add("network", &["<Ctrl><Shift>d"], Box::new(|w| w.go(Loc::Network, true)));
-        add("connect", &["<Ctrl><Shift>k"], Box::new(|w| w.connect_dialog()));
-        add("cancel-connect", &[], Box::new(|w| w.active().stop_connecting()));
-        add("new-tab", &["<Ctrl>t"], Box::new(|w| {
+        add("drives", Box::new(|w| w.go(Loc::Drives, true)));
+        add("network", Box::new(|w| w.go(Loc::Network, true)));
+        add("connect", Box::new(|w| w.connect_dialog()));
+        add("cancel-connect", Box::new(|w| w.active().stop_connecting()));
+        add("new-tab", Box::new(|w| {
             let loc = w.active_loc();
             w.new_tab(loc, true);
         }));
-        add("close-tab", &["<Ctrl>w"], Box::new(|w| w.close_tab(w.cur_tab.get())));
-        add("next-tab", &["<Ctrl>Tab", "<Ctrl>Page_Down"], Box::new(|w| w.cycle_tab(1)));
-        add("prev-tab", &["<Ctrl><Shift>Tab", "<Ctrl>Page_Up", "<Ctrl><Shift>ISO_Left_Tab"], Box::new(|w| w.cycle_tab(-1)));
-        add("split", &["F3"], Box::new(|w| w.toggle_split()));
-        add("other-pane", &["<Ctrl>grave"], Box::new(|w| {
+        add("close-tab", Box::new(|w| w.close_tab(w.cur_tab.get())));
+        add("next-tab", Box::new(|w| w.cycle_tab(1)));
+        add("prev-tab", Box::new(|w| w.cycle_tab(-1)));
+        add("split", Box::new(|w| w.toggle_split()));
+        add("other-pane", Box::new(|w| {
             let t = w.active_tab();
             if t.panes.borrow().len() > 1 {
                 let o = 1 - t.active.get().min(1);
@@ -1126,37 +1214,58 @@ impl Win {
                 p.files.grab_focus();
             }
         }));
-        add("mode-grid", &["<Ctrl>1"], Box::new(|w| w.active().set_mode(Mode::Grid)));
-        add("mode-compact", &["<Ctrl>2"], Box::new(|w| w.active().set_mode(Mode::Compact)));
-        add("mode-list", &["<Ctrl>3"], Box::new(|w| w.active().set_mode(Mode::List)));
-        add("quit", &["<Ctrl>q"], Box::new(|w| w.window.close()));
-        add("settings", &["<Ctrl>comma"], Box::new(|w| settings::Settings::present(w)));
-        add("open-config", &[], Box::new(|w| w.launch(&gio::File::for_path(config::config_path()))));
-        add("section-new", &[], Box::new(|w| w.sidebar.new_section(w)));
-        add("trash", &[], Box::new(|w| {
+        add("mode-grid", Box::new(|w| w.active().set_mode(Mode::Grid)));
+        add("mode-compact", Box::new(|w| w.active().set_mode(Mode::Compact)));
+        add("mode-list", Box::new(|w| w.active().set_mode(Mode::List)));
+        add("quit", Box::new(|w| w.window.close()));
+        add("settings", Box::new(|w| settings::Settings::present(w)));
+        add("open-config", Box::new(|w| w.launch(&gio::File::for_path(config::config_path()))));
+        add("section-new", Box::new(|w| w.sidebar.new_section(w)));
+        add("parent", Box::new(|w| w.active().go_up()));
+        add("open-selected", Box::new(|w| w.active().open_selected()));
+        add("menu", Box::new(|w| w.active().menu_for_selection()));
+        add("quicklook", Box::new(|w| w.toggle_quick_look()));
+        add("preview", Box::new(|w| w.preview_btn.set_active(!w.preview_btn.is_active())));
+        add("search", Box::new(|w| {
+            if w.search_btn.is_active() {
+                w.filter_entry.grab_focus();
+            } else {
+                w.search_btn.set_active(true);
+            }
+        }));
+        add("terminal-here", Box::new(|w| {
+            if let Some(d) = w.active().current_file() {
+                w.open_terminal(d);
+            }
+        }));
+        add("trash", Box::new(|w| {
             let files = w.active().selected_files();
+            // inside the Trash there's only deleting for good
+            if w.active().in_trash() {
+                return w.delete_files(files);
+            }
             w.trash_files(files);
         }));
-        add("delete", &[], Box::new(|w| {
+        add("delete", Box::new(|w| {
             let files = w.active().selected_files();
             w.delete_files(files);
         }));
-        add("restore", &[], Box::new(|w| w.restore_selection()));
-        add("extract-here", &[], Box::new(|w| {
+        add("restore", Box::new(|w| w.restore_selection()));
+        add("extract-here", Box::new(|w| {
             let files = w.active().selected_files();
             w.extract(files, None);
         }));
-        add("extract-to", &[], Box::new(|w| {
+        add("extract-to", Box::new(|w| {
             let files = w.active().selected_files();
             w.extract_to(files);
         }));
-        add("compress", &[], Box::new(|w| {
+        add("compress", Box::new(|w| {
             let files = w.active().selected_files();
             w.compress_dialog(files);
         }));
-        add("empty-trash", &[], Box::new(|w| w.empty_trash()));
-        add("undo", &["<Ctrl>z"], Box::new(|w| w.undo()));
-        add("properties", &["<Alt>Return"], Box::new(|w| {
+        add("empty-trash", Box::new(|w| w.empty_trash()));
+        add("undo", Box::new(|w| w.undo()));
+        add("properties", Box::new(|w| {
             let p = w.active();
             let mut files = p.selected_files();
             if files.is_empty() {
@@ -1166,16 +1275,16 @@ impl Win {
         }));
         // Ctrl+C/X/V/A and F2 are handled by the file views' key controller, so text
         // fields keep their own copy/paste.
-        add("copy", &[], Box::new(|w| w.clipboard_set(w.active().selected_files(), false)));
-        add("cut", &[], Box::new(|w| w.clipboard_set(w.active().selected_files(), true)));
-        add("paste", &[], Box::new(|w| {
+        add("copy", Box::new(|w| w.clipboard_set(w.active().selected_files(), false)));
+        add("cut", Box::new(|w| w.clipboard_set(w.active().selected_files(), true)));
+        add("paste", Box::new(|w| {
             if let Some(d) = w.active().current_file() {
                 w.paste_into(d);
             }
         }));
-        add("new-folder", &["<Ctrl><Shift>n"], Box::new(|w| w.new_folder()));
-        add("rename", &[], Box::new(|w| w.rename_selection()));
-        add("select-all", &[], Box::new(|w| {
+        add("new-folder", Box::new(|w| w.new_folder()));
+        add("rename", Box::new(|w| w.rename_selection()));
+        add("select-all", Box::new(|w| {
             w.active().files.selection.select_all();
         }));
         for i in 1..=8u32 {
@@ -1245,6 +1354,11 @@ impl Win {
             let files = w.active().selected_files();
             if !files.is_empty() {
                 w.choose_app(files, ctype);
+            }
+        }));
+        add_s("custom", Box::new(|w, i| {
+            if let Ok(i) = i.parse() {
+                w.run_action(i);
             }
         }));
         add_s("share", Box::new(|w, uri| w.share_dialog(gio::File::for_uri(&uri))));
@@ -1753,6 +1867,7 @@ impl Win {
                 let Some(w) = weak.upgrade() else { return };
                 match r {
                     Ok(newf) => {
+                        w.refresh_searches();
                         w.undo.borrow_mut().push(UndoOp::Rename { file: newf, old_name: old });
                         w.show_notice(&format!("Renamed to {name} · Ctrl+Z to undo"), false);
                     }

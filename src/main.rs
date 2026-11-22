@@ -1,11 +1,15 @@
+mod actions;
 mod archive;
 mod config;
 mod drives;
+mod keys;
 mod net;
 mod ops;
 mod rename;
+mod search;
 mod share;
 mod theme;
+mod thumbs;
 mod transfer;
 mod ui;
 mod util;

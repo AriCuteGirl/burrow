@@ -29,6 +29,10 @@ pub struct Settings {
     icon_size: gtk::Scale,
     drives_page: gtk::Switch,
     network_page: gtk::Switch,
+    thumbnails: gtk::Switch,
+    preview_pane: gtk::Switch,
+    vim_keys: gtk::Switch,
+    extras: super::extras::Extras,
     sort: gtk::DropDown,
     sort_desc: gtk::Switch,
 }
@@ -53,7 +57,7 @@ fn folder_color_label(c: &str) -> String {
     }
 }
 
-fn row(group: &gtk::Box, title: &str, subtitle: &str, control: &impl IsA<gtk::Widget>) {
+pub(super) fn row(group: &gtk::Box, title: &str, subtitle: &str, control: &impl IsA<gtk::Widget>) {
     let r = gtk::Box::new(gtk::Orientation::Horizontal, 16);
     r.add_css_class("settings-row");
     let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -196,6 +200,13 @@ impl Settings {
         row(&g, "Drives page in the sidebar", "The overview with a usage bar per drive", &drives_page);
         let network_page = gtk::Switch::new();
         row(&g, "Network page in the sidebar", "Servers, other computers, and what you share", &network_page);
+        let thumbnails = gtk::Switch::new();
+        row(&g, "Thumbnails", "For images, videos, PDFs, fonts and more", &thumbnails);
+        let preview_pane = gtk::Switch::new();
+        row(&g, "Preview pane", "Space shows a quick look any time", &preview_pane);
+        let vim_keys = gtk::Switch::new();
+        row(&g, "Vim keys", "hjkl, gg, G, yy, dd, p, / … in the file view; typing then doesn't filter", &vim_keys);
+        let extras = super::extras::Extras::new(&root);
 
         // ---------------- footer
         let foot = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -229,6 +240,10 @@ impl Settings {
             icon_size,
             drives_page,
             network_page,
+            thumbnails,
+            preview_pane,
+            vim_keys,
+            extras,
             sort,
             sort_desc,
         };
@@ -339,6 +354,9 @@ impl Settings {
             (&self.show_hidden, |c, v| c.view.show_hidden = v),
             (&self.drives_page, |c, v| c.view.drives_page = v),
             (&self.network_page, |c, v| c.view.network_page = v),
+            (&self.thumbnails, |c, v| c.view.thumbnails = v),
+            (&self.preview_pane, |c, v| c.view.preview_pane = v),
+            (&self.vim_keys, |c, v| c.view.vim_keys = v),
         ] {
             let e = edit.clone();
             sw.connect_active_notify(move |s| {
@@ -405,7 +423,7 @@ impl Settings {
     }
 
     /// Controls follow the config (called after any config change).
-    pub fn sync(&self, w: &Win) {
+    pub fn sync(&self, w: &Rc<Win>) {
         let c = w.cfg.borrow().clone();
         self.syncing.set(true);
         match c.appearance.radius {
@@ -443,7 +461,11 @@ impl Settings {
         self.show_hidden.set_active(c.view.show_hidden);
         self.drives_page.set_active(c.view.drives_page);
         self.network_page.set_active(c.view.network_page);
+        self.thumbnails.set_active(c.view.thumbnails);
+        self.preview_pane.set_active(c.view.preview_pane);
+        self.vim_keys.set_active(c.view.vim_keys);
         self.syncing.set(false);
+        self.extras.sync(w);
     }
 }
 

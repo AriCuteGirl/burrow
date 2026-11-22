@@ -15,6 +15,12 @@ pub struct Config {
     pub appearance: AppearanceCfg,
     pub view: ViewCfg,
     pub apps: AppsCfg,
+    /// Shortcuts that differ from the defaults: copy = ["<Ctrl>Insert"]; [] turns one off.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: crate::keys::Overrides,
+    /// Own right-click actions.
+    #[serde(rename = "action", skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<crate::actions::Action>,
     /// Sidebar sections, top to bottom.
     #[serde(rename = "section")]
     pub sections: Vec<Section>,
@@ -58,6 +64,12 @@ pub struct ViewCfg {
     pub drives_page: bool,
     /// Show the "Network" page in the sidebar
     pub network_page: bool,
+    /// Make thumbnails for images, videos, PDFs, fonts…
+    pub thumbnails: bool,
+    /// Preview pane on the right
+    pub preview_pane: bool,
+    /// hjkl, gg, yy, dd, p, / … in the file view (typing then doesn't filter)
+    pub vim_keys: bool,
     /// "name", "size", "modified" or "type"
     pub sort: String,
     pub sort_desc: bool,
@@ -136,6 +148,9 @@ impl Default for ViewCfg {
             icon_size: 64,
             drives_page: true,
             network_page: true,
+            thumbnails: true,
+            preview_pane: false,
+            vim_keys: false,
             sort: "name".into(),
             sort_desc: false,
         }
@@ -162,6 +177,8 @@ impl Default for Config {
             appearance: AppearanceCfg::default(),
             view: ViewCfg::default(),
             apps: AppsCfg::default(),
+            keys: BTreeMap::new(),
+            actions: vec![],
             sections: vec![],
             drives: BTreeMap::new(),
             folders: BTreeMap::new(),
@@ -219,6 +236,8 @@ impl Config {
         if !matches!(self.view.sort.as_str(), "name" | "size" | "modified" | "type") {
             self.view.sort = "name".into();
         }
+        crate::keys::sanitize(&mut self.keys, |a| !a.trim().is_empty());
+        self.actions.retain(|a| a.valid().is_ok());
         for f in self.folders.values_mut() {
             if f.view.as_deref().is_some_and(|v| !matches!(v, "grid" | "list" | "compact")) {
                 f.view = None;

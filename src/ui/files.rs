@@ -5,7 +5,10 @@
 use super::dirmodel::DirModel;
 use super::pane::Pane;
 use crate::config::Config;
+use crate::search::{self, Query, Shared};
+use crate::thumbs::{self, Size};
 use crate::util;
+use super::thumbq;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::cell::{Cell, RefCell};
@@ -75,12 +78,15 @@ struct Look {
     /// folder key (see `folder_key`) -> icon string from config
     folder_icons: RefCell<HashMap<String, String>>,
     icon_size: Cell<i32>,
+    thumbnails: Cell<bool>,
+    searching: Cell<bool>,
 }
 
 pub struct Files {
     pub widget: gtk::Stack,
     dir: Rc<DirModel>,
     filtered: gtk::FilterListModel,
+    sorted: gtk::SortListModel,
     pub selection: gtk::MultiSelection,
     grid: gtk::GridView,
     compact: gtk::GridView,
@@ -105,6 +111,14 @@ pub struct Files {
     skeleton_timer: RefCell<Option<glib::SourceId>>,
     connecting: Cell<bool>,
     connecting_title: gtk::Label,
+    /// The toolbar's "search in subfolders" is on for this pane
+    pub search_mode: Cell<bool>,
+    query: RefCell<String>,
+    search: RefCell<Option<(gio::Cancellable, std::sync::Arc<Shared>)>>,
+    cursor: Cell<Option<u32>>,
+    /// Just opened: show the top once it's loaded
+    to_top: Cell<bool>,
+    pub vim: RefCell<crate::keys::Vim>,
 }
 
 pub fn info_file(info: &gio::FileInfo) -> Option<gio::File> {
@@ -143,6 +157,7 @@ impl Files {
         let filter_text = Rc::new(RefCell::new(String::new()));
         let look = Rc::new(Look::default());
         look.icon_size.set(cfg.view.icon_size as i32);
+        look.thumbnails.set(cfg.view.thumbnails);
         let pane: Rc<RefCell<Weak<Pane>>> = Rc::new(RefCell::new(Weak::new()));
 
         let dir = DirModel::new(ATTRS);
@@ -178,10 +193,10 @@ impl Files {
             first.then(key).into()
         });
         let filtered = gtk::FilterListModel::new(Some(dir.store.clone()), Some(filter.clone()));
-        filtered.set_incremental(true);
+        // filtering is cheap; doing it at once lets the sort run once instead of per chunk
         let sorted = gtk::SortListModel::new(Some(filtered.clone()), Some(sorter.clone()));
         sorted.set_incremental(true);
-        let selection = gtk::MultiSelection::new(Some(sorted));
+        let selection = gtk::MultiSelection::new(Some(sorted.clone()));
 
         // ---------------- grid
         let grid = gtk::GridView::new(Some(selection.clone()), Some(grid_factory(&look, &pane)));
@@ -201,7 +216,7 @@ impl Files {
         list.set_show_row_separators(false);
         list.set_reorderable(false);
         for (id, title, expand, width) in
-            [("name", "Name", true, 320), ("size", "Size", false, 100), ("type", "Type", false, 180), ("modified", "Modified", false, 170)]
+            [("name", "Name", true, 320), ("where", "Folder", false, 240), ("size", "Size", false, 100), ("type", "Type", false, 180), ("modified", "Modified", false, 170)]
         {
             let col = gtk::ColumnViewColumn::new(Some(title), Some(list_factory(id, &look, &pane)));
             col.set_id(Some(id));
@@ -210,6 +225,8 @@ impl Files {
             col.set_fixed_width(width);
             // a sorter makes the header clickable; the real sorting is ours (folders first etc.)
             col.set_sorter(Some(&gtk::CustomSorter::new(|_, _| gtk::Ordering::Equal)));
+            // only shown for search results
+            col.set_visible(id != "where");
             list.append_column(&col);
         }
 
@@ -285,6 +302,7 @@ impl Files {
             widget,
             dir,
             filtered,
+            sorted,
             selection,
             grid,
             compact,
@@ -309,6 +327,12 @@ impl Files {
             skeleton_timer: RefCell::new(None),
             connecting: Cell::new(false),
             connecting_title,
+            search_mode: Cell::new(false),
+            query: RefCell::default(),
+            search: RefCell::default(),
+            cursor: Cell::new(None),
+            to_top: Cell::new(false),
+            vim: RefCell::default(),
         };
         f.set_folder_icons(cfg);
         f.sync_list_sort_indicator();
@@ -347,16 +371,29 @@ impl Files {
                     pending.set(false);
                     if let Some(p) = weak.upgrade() {
                         p.status_changed();
+                        // items can leave the selection without a selection signal
+                        p.selection_changed();
                     }
                 });
             }
         };
         let r = refresh.clone();
         self.dir.connect_state(move || r());
+        // filtering and sorting go on in the background after loading
+        let r = refresh.clone();
+        self.filtered.connect_pending_notify(move |_| r());
+        let r = refresh.clone();
+        self.sorted.connect_pending_notify(move |_| r());
         let r = refresh.clone();
         self.filtered.connect_items_changed(move |_, _, _, _| r());
         let r = refresh.clone();
-        self.selection.connect_selection_changed(move |_, _, _| r());
+        let weak = Rc::downgrade(pane);
+        self.selection.connect_selection_changed(move |_, _, _| {
+            r();
+            if let Some(p) = weak.upgrade() {
+                p.selection_changed();
+            }
+        });
 
         // List header click -> our sort key
         let weak = Rc::downgrade(pane);
@@ -392,53 +429,36 @@ impl Files {
             let view = self.widget.clone().upcast::<gtk::Widget>();
             // Backspace = parent, typing = filter-as-you-type
             let keys = gtk::EventControllerKey::new();
+            // before the views' own keys (Space would only toggle the selection)
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
             let weak = Rc::downgrade(pane);
             keys.connect_key_pressed(move |_, key, _, mods| {
                 let Some(p) = weak.upgrade() else { return glib::Propagation::Proceed };
-                if key == gdk::Key::BackSpace && mods.is_empty() {
-                    p.go_up();
-                    return glib::Propagation::Stop;
+                let Some(w) = p.win() else { return glib::Propagation::Proceed };
+                // buttons on the error/empty pages keep their keys
+                if gtk::prelude::RootExt::focus(&w.window).is_some_and(|f| f.is::<gtk::Button>()) {
+                    return glib::Propagation::Proceed;
                 }
-                let ctrl_only = mods & (gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::ALT_MASK) == gdk::ModifierType::CONTROL_MASK;
-                let act = |name: &str| {
-                    if let Some(w) = p.win() {
-                        gio::prelude::ActionGroupExt::activate_action(&w.window, name, None);
-                    }
-                };
-                if ctrl_only {
-                    let name = match key.to_lower() {
-                        gdk::Key::c => Some("copy"),
-                        gdk::Key::x => Some("cut"),
-                        gdk::Key::v => Some("paste"),
-                        gdk::Key::a => Some("select-all"),
-                        _ => None,
-                    };
-                    if let Some(n) = name {
-                        act(n);
-                        return glib::Propagation::Stop;
-                    }
-                }
-                if key == gdk::Key::F2 && mods.is_empty() {
-                    act("rename");
-                    return glib::Propagation::Stop;
-                }
-                if key == gdk::Key::Delete || key == gdk::Key::KP_Delete {
-                    let files = p.selected_files();
-                    if let Some(w) = p.win() {
-                        if mods.contains(gdk::ModifierType::SHIFT_MASK) || p.in_trash() {
-                            w.delete_files(files);
-                        } else {
-                            w.trash_files(files);
-                        }
-                    }
-                    return glib::Propagation::Stop;
-                }
-                if key == gdk::Key::Menu || (key == gdk::Key::F10 && mods == gdk::ModifierType::SHIFT_MASK) {
-                    p.menu_for_selection();
+                let act = |name: &str| gio::prelude::ActionGroupExt::activate_action(&w.window, name, None);
+                if let Some(id) = w.view_key(key, mods) {
+                    p.files.vim.borrow_mut().reset();
+                    act(id);
                     return glib::Propagation::Stop;
                 }
                 let plain = !mods.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK);
                 if let Some(c) = key.to_unicode().filter(|c| plain && !c.is_control() && !c.is_whitespace()) {
+                    if w.cfg.borrow().view.vim_keys {
+                        use crate::keys::Cmd;
+                        let cmd = p.files.vim.borrow_mut().feed(c, p.files.mode() == Mode::List);
+                        match cmd {
+                            Cmd::Move(x, y) => p.files.move_cursor(x, y),
+                            Cmd::Top => p.files.jump(false),
+                            Cmd::Bottom => p.files.jump(true),
+                            Cmd::Act(a) => act(a),
+                            Cmd::Wait | Cmd::None => {}
+                        }
+                        return glib::Propagation::Stop;
+                    }
                     p.start_filter(c);
                     return glib::Propagation::Stop;
                 }
@@ -487,9 +507,14 @@ impl Files {
     }
 
     pub fn open(&self, f: &gio::File) {
+        self.stop_search();
+        self.search_mode.set(false);
+        self.cursor.set(None);
+        self.vim.borrow_mut().reset();
         self.filter_text.borrow_mut().clear();
         self.filter.changed(gtk::FilterChange::LessStrict);
         self.selection.unselect_all();
+        self.to_top.set(true);
         self.dir.set_file(Some(f));
         if self.selection.n_items() > 0 {
             self.grid.scroll_to(0, gtk::ListScrollFlags::NONE, None);
@@ -497,7 +522,152 @@ impl Files {
     }
 
     pub fn reload(&self) {
-        self.dir.reload();
+        if self.is_searching() {
+            let q = self.query.borrow().clone();
+            self.start_search(&q);
+        } else {
+            self.dir.reload();
+        }
+    }
+
+    // ---------------------------------------------------------------- search
+    pub fn is_searching(&self) -> bool {
+        self.search.borrow().is_some()
+    }
+
+    pub fn query(&self) -> String {
+        self.query.borrow().clone()
+    }
+
+    fn show_where(&self, on: bool) {
+        self.look.searching.set(on);
+        let cols = self.list.columns();
+        for i in 0..cols.n_items() {
+            if let Some(c) = cols.item(i).and_downcast::<gtk::ColumnViewColumn>() {
+                if c.id().as_deref() == Some("where") {
+                    c.set_visible(on);
+                }
+            }
+        }
+    }
+
+    fn stop_search(&self) {
+        if let Some((c, _)) = self.search.borrow_mut().take() {
+            c.cancel();
+        }
+        self.query.borrow_mut().clear();
+        self.show_where(false);
+    }
+
+    /// Search this folder and everything below it; empty text goes back to the folder.
+    pub fn start_search(&self, text: &str) {
+        let q = Query::new(text);
+        let Some(root) = self.dir.file() else { return };
+        if q.is_empty() {
+            if self.is_searching() {
+                self.stop_search();
+                self.dir.reload();
+            }
+            return;
+        }
+        if let Some((c, _)) = self.search.borrow_mut().take() {
+            c.cancel();
+        }
+        *self.query.borrow_mut() = text.to_string();
+        self.filter_text.borrow_mut().clear();
+        self.filter.changed(gtk::FilterChange::LessStrict);
+        self.show_where(true);
+        let cancel = self.dir.begin_results();
+        let shared = std::sync::Arc::new(Shared::default());
+        *self.search.borrow_mut() = Some((cancel.clone(), shared.clone()));
+        let (s2, c2, hidden) = (shared.clone(), cancel.clone(), self.show_hidden.get());
+        // own thread: a search can take long, and must not eat the pool file jobs use
+        std::thread::spawn(move || search::run(&root, &q, hidden, &s2, &c2));
+        let dir = Rc::downgrade(&self.dir);
+        glib::spawn_future_local(async move {
+            use std::sync::atomic::Ordering;
+            loop {
+                let done = shared.done.load(Ordering::Acquire);
+                let batch: Vec<gio::File> = shared.found.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+                let mut infos = vec![];
+                for f in batch {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let Some(d) = dir.upgrade() else { return };
+                    if let Ok(i) = f.query_info_future(d.attrs(), gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT).await {
+                        i.set_attribute_object("standard::file", &f);
+                        infos.push(i);
+                    }
+                }
+                let Some(d) = dir.upgrade() else { return };
+                if cancel.is_cancelled() {
+                    return;
+                }
+                d.store.splice(d.store.n_items(), 0, &infos);
+                if done && shared.found.lock().map(|v| v.is_empty()).unwrap_or(true) {
+                    d.end_results();
+                    return;
+                }
+                glib::timeout_future(std::time::Duration::from_millis(90)).await;
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- cursor
+    /// How many cells fit in a row right now (from what's actually on screen).
+    fn columns_now(&self) -> u32 {
+        let grid = match self.mode.get() {
+            Mode::Grid => &self.grid,
+            Mode::Compact => &self.compact,
+            Mode::List => return 1,
+        };
+        let mut rows: HashMap<i32, u32> = HashMap::new();
+        let mut c = grid.first_child();
+        while let Some(x) = c {
+            if x.is_mapped() {
+                if let Some(b) = x.compute_bounds(grid) {
+                    *rows.entry(b.y().round() as i32).or_default() += 1;
+                }
+            }
+            c = x.next_sibling();
+        }
+        rows.values().copied().max().unwrap_or(1)
+    }
+
+    fn cursor_pos(&self) -> Option<u32> {
+        let sel = self.selection.selection();
+        match sel.size() {
+            0 => self.cursor.get().filter(|c| *c < self.selection.n_items()),
+            1 => Some(sel.nth(0)),
+            _ => self.cursor.get().filter(|c| sel.contains(*c)).or(Some(sel.nth(0))),
+        }
+    }
+
+    pub fn set_cursor(&self, pos: u32) {
+        if pos >= self.selection.n_items() {
+            return;
+        }
+        self.cursor.set(Some(pos));
+        let f = gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT;
+        match self.mode.get() {
+            Mode::Grid => self.grid.scroll_to(pos, f, None),
+            Mode::Compact => self.compact.scroll_to(pos, f, None),
+            Mode::List => self.list.scroll_to(pos, None, f, None),
+        }
+    }
+
+    pub fn move_cursor(&self, dx: i32, dy: i32) {
+        if let Some(p) = crate::keys::step(self.cursor_pos(), self.selection.n_items(), self.columns_now(), dx, dy) {
+            self.set_cursor(p);
+        }
+    }
+
+    pub fn jump(&self, last: bool) {
+        let n = self.selection.n_items();
+        if n > 0 {
+            self.set_cursor(if last { n - 1 } else { 0 });
+        }
     }
 
     fn showing_view(&self) -> bool {
@@ -593,7 +763,7 @@ impl Files {
             self.sync_list_sort_indicator();
         }
         let s = cfg.view.icon_size as i32;
-        let resize = self.look.icon_size.replace(s) != s;
+        let resize = self.look.icon_size.replace(s) != s || self.look.thumbnails.replace(cfg.view.thumbnails) != cfg.view.thumbnails;
         if self.set_folder_icons(cfg) | resize {
             self.rebind();
         }
@@ -624,6 +794,28 @@ impl Files {
             return;
         }
         let n = self.filtered.n_items();
+        let settled = !self.dir.is_loading() && self.filtered.pending() == 0 && self.sorted.pending() == 0;
+        if settled && self.to_top.replace(false) && self.selection.selection().is_empty() && n > 0 {
+            // entries sorted in above the first ones keep the old spot otherwise
+            let weak = Rc::downgrade(p);
+            glib::idle_add_local_once(move || {
+                let Some(p) = weak.upgrade() else { return };
+                let f = &p.files;
+                if f.selection.n_items() == 0 {
+                    return;
+                }
+                if f.filtered.pending() > 0 || f.sorted.pending() > 0 {
+                    // the sort only looked finished: the next change brings us back here
+                    f.to_top.set(true);
+                    return;
+                }
+                match f.mode.get() {
+                    Mode::Grid => f.grid.scroll_to(0, gtk::ListScrollFlags::NONE, None),
+                    Mode::Compact => f.compact.scroll_to(0, gtk::ListScrollFlags::NONE, None),
+                    Mode::List => f.list.scroll_to(0, None, gtk::ListScrollFlags::NONE, None),
+                }
+            });
+        }
         let view = self.mode.get().name();
         if let Some(e) = self.dir.error() {
             let (icon, title, text) = describe_error(&e);
@@ -654,7 +846,10 @@ impl Files {
             *self.skeleton_timer.borrow_mut() = Some(id);
         } else if n == 0 {
             let q = self.filter_text.borrow();
-            if !q.is_empty() {
+            if self.is_searching() {
+                self.empty_title.set_text("Nothing found");
+                self.empty_text.set_text(&format!("Nothing in this folder or below it matches “{}”. Use * and ? as wildcards.", self.query.borrow()));
+            } else if !q.is_empty() {
                 self.empty_title.set_text("No matches");
                 self.empty_text.set_text(&format!("Nothing here matches “{q}”. Press Esc to clear the filter."));
             } else if self.dir.n_items() > 0 {
@@ -729,7 +924,17 @@ impl Files {
             if folders == 1 { "" } else { "s" },
             if files == 1 { "" } else { "s" }
         );
-        if self.dir.is_loading() {
+        if let Some((_, s)) = self.search.borrow().as_ref() {
+            use std::sync::atomic::Ordering;
+            let scanned = s.scanned.load(Ordering::Relaxed);
+            if self.dir.is_loading() {
+                out.push_str(&format!(" found · searching, {scanned} looked at"));
+            } else if s.truncated.load(Ordering::Relaxed) {
+                out.push_str(&format!(" found · stopped at {} results", search::MAX_RESULTS));
+            } else {
+                out.push_str(&format!(" found · {scanned} looked at"));
+            }
+        } else if self.dir.is_loading() {
             out.push_str(" · loading…");
         }
         let sel = self.selected_infos();
@@ -919,36 +1124,48 @@ fn grid_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::SignalL
         badge.set_visible(info.is_symlink());
         let name = info.display_name();
         lbl.set_text(&name);
-        vb.set_tooltip_text(Some(&name));
+        vb.set_tooltip_text(Some(&tip(&info, &lk)));
         set_hidden_class(vb.upcast_ref(), &info);
         img.set_from_gicon(&item_icon(&info, &lk));
         img.set_visible(true);
         pic.set_visible(false);
         pic.set_paintable(None::<&gdk::Paintable>);
-        // Thumbnail from the XDG cache, if one already exists. Read off the UI thread.
-        let token = info.name().to_string_lossy().to_string();
+        // Thumbnail: made (or read from the XDG cache) off the UI thread, newest cells first.
+        let Some(f) = info_file(&info) else { return };
+        let token = f.uri().to_string();
         vb.set_widget_name(&token);
-        let thumb = info
-            .attribute_byte_string("thumbnail::path")
-            .filter(|_| !info.has_attribute("thumbnail::is-valid") || info.boolean("thumbnail::is-valid"));
-        if let Some(path) = thumb {
-            let path = path.to_string();
-            let vbw = vb.downgrade();
-            glib::spawn_future_local(async move {
-                let Ok(Ok(bytes)) = gio::spawn_blocking(move || std::fs::read(path)).await else { return };
-                let Some(vb) = vbw.upgrade() else { return };
+        if !lk.thumbnails.get() {
+            return;
+        }
+        if let Some(src) = thumbs::source(&info, &f) {
+            let size = if lk.icon_size.get() > 128 { Size::XLarge } else { Size::Large };
+            let (vw, vw2, tk) = (vb.downgrade(), vb.downgrade(), token.clone());
+            // still the same file, and still on screen
+            let wanted = move || vw.upgrade().is_some_and(|v| v.widget_name() == tk && v.is_mapped());
+            let show = move |t: gdk::Texture| {
+                let Some(vb) = vw2.upgrade() else { return };
                 if vb.widget_name() != token {
-                    return; // cell was recycled for another file
+                    return;
                 }
-                if let (Ok(tex), Some((img, pic, _, _))) = (gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)), grid_parts(&vb)) {
-                    pic.set_paintable(Some(&tex));
+                if let Some((img, pic, _, _)) = grid_parts(&vb) {
+                    pic.set_paintable(Some(&t));
                     pic.set_visible(true);
                     img.set_visible(false);
                 }
-            });
+            };
+            // cells are bound before they're mapped: ask a moment later
+            glib::idle_add_local_once(move || thumbq::request(src, size, wanted, show));
         }
     });
     factory
+}
+
+/// The name, or the whole path for search results.
+fn tip(info: &gio::FileInfo, look: &Look) -> String {
+    match info_file(info).filter(|_| look.searching.get()) {
+        Some(f) => f.parse_name().to_string(),
+        None => info.display_name().to_string(),
+    }
 }
 
 /// Small arrow in the corner of an icon: "this is a shortcut".
@@ -1010,7 +1227,7 @@ fn compact_factory(look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>>>) -> gtk::Sign
         }
         img.set_from_gicon(&item_icon(&info, &lk));
         lbl.set_text(&info.display_name());
-        hb.set_tooltip_text(Some(&info.display_name()));
+        hb.set_tooltip_text(Some(&tip(&info, &lk)));
         set_hidden_class(hb.upcast_ref(), &info);
     });
     factory
@@ -1051,6 +1268,10 @@ fn list_factory(col: &'static str, look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>
                 }
                 info.display_name().to_string()
             }
+            "where" => info_file(&info)
+                .and_then(|f| f.parent())
+                .map(|p| util::contract_tilde(&p.parse_name(), &glib::home_dir().to_string_lossy()))
+                .unwrap_or_default(),
             "size" => if is_dir { "—".into() } else { util::human_size(info.size().max(0) as u64) },
             "type" => {
                 if is_dir {

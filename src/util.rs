@@ -4,6 +4,40 @@ use std::cmp::Ordering;
 
 /// Natural, case-insensitive compare: "file2" < "file10".
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        return natural_ascii(a.as_bytes(), b.as_bytes());
+    }
+    natural_unicode(a, b)
+}
+
+/// The same order without any allocation (most names): sorting a big folder calls this a lot.
+fn natural_ascii(a: &[u8], b: &[u8]) -> Ordering {
+    let digits = |s: &[u8], i: usize| s[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let (na, nb) = (&a[i..i + digits(a, i)], &b[j..j + digits(b, j)]);
+            let cut = |s: &[u8]| s.iter().take_while(|c| **c == b'0').count();
+            let (ta, tb) = (&na[cut(na)..], &nb[cut(nb)..]);
+            let o = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb)).then_with(|| na.len().cmp(&nb.len()));
+            if o != Ordering::Equal {
+                return o;
+            }
+            i += na.len();
+            j += nb.len();
+        } else {
+            let (x, y) = (a[i].to_ascii_lowercase(), b[j].to_ascii_lowercase());
+            if x != y {
+                return x.cmp(&y);
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j)).then_with(|| a.cmp(b))
+}
+
+fn natural_unicode(a: &str, b: &str) -> Ordering {
     let (mut ai, mut bi) = (a.chars().peekable(), b.chars().peekable());
     loop {
         match (ai.peek().copied(), bi.peek().copied()) {
@@ -129,6 +163,13 @@ mod tests {
         let mut v = vec!["file10", "File2", "file1", "a", "B", "file02", "file2"];
         v.sort_by(|a, b| natural_cmp(a, b));
         assert_eq!(v, ["a", "B", "file1", "File2", "file2", "file02", "file10"]);
+        // the fast path gives exactly the same order
+        let names = ["", "0", "00", "a1b", "a01b", "a1B", "A1b", "x10y2", "x10y10", "x9", "_", "-", "file", "File", "1a", "01a"];
+        for a in names {
+            for b in names {
+                assert_eq!(natural_ascii(a.as_bytes(), b.as_bytes()), natural_unicode(a, b), "{a:?} {b:?}");
+            }
+        }
     }
 
     #[test]

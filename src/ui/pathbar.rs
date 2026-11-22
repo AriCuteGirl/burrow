@@ -25,7 +25,14 @@ impl Pathbar {
         frame.add_css_class("pathbar");
         let crumbs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         crumbs.set_valign(gtk::Align::Center);
-        frame.append(&crumbs);
+        // scrolls instead of forcing the window wide; the end (current folder) stays in view
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
+        scroll.set_propagate_natural_width(true);
+        scroll.set_min_content_width(60);
+        scroll.set_child(Some(&crumbs));
+        scroll.hadjustment().connect_changed(|a| a.set_value(a.upper() - a.page_size()));
+        frame.append(&scroll);
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         frame.append(&spacer);

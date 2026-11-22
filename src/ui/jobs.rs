@@ -169,7 +169,10 @@ where
         w.jobs.running.set(w.jobs.running.get().saturating_sub(1));
         w.jobs.update_button();
         match res {
-            Ok(r) => done(&w, r, &progress, cancel.is_cancelled()),
+            Ok(r) => {
+                done(&w, r, &progress, cancel.is_cancelled());
+                w.refresh_searches();
+            }
             Err(_) => w.show_notice("A background job crashed; nothing else was touched", true),
         }
     });
