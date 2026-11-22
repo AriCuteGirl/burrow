@@ -175,10 +175,11 @@ gridview.files > child {
   background: transparent;
   border: 1px solid transparent;
   border-radius: $R_SMALL;
-  padding: 10px 6px 8px 6px;
+  padding: 0;
   margin: 3px;
   color: @text_dim;
 }
+gridview.files .cell { padding: 10px 6px 8px 6px; }
 gridview.files > child:hover { background: @hover_bg; color: @text; }
 gridview.files > child:selected {
   background: @sel_bg;
@@ -358,7 +359,8 @@ button.toggle.flat-btn:disabled { opacity: 0.35; }
 .pane .toolbar { padding: 6px 12px 8px 12px; }
 
 /* ---------------- compact + list views ---------------- */
-gridview.files.compact > child { padding: 4px 8px; margin: 1px; }
+gridview.files.compact > child { margin: 1px; }
+gridview.files.compact .cell { padding: 4px 8px; }
 columnview.files { background: transparent; color: @text_dim; }
 columnview.files > header {
   background: transparent;
@@ -384,7 +386,8 @@ columnview.files > listview > row {
 }
 columnview.files > listview > row:hover { background: @hover_bg; color: @text; }
 columnview.files > listview > row:selected { background: @sel_bg; border-color: @crimson; color: @text; }
-columnview.files > listview > row > cell { padding: 3px 10px; }
+columnview.files > listview > row > cell { padding: 0; }
+columnview.files .cell { padding: 3px 10px; }
 .file-meta { font-size: 12px; color: @text_faint; }
 columnview.files > listview > row:selected .file-meta { color: @text_dim; }
 rubberband { background: alpha(@accent, 0.18); border: 1px solid @crimson; }

@@ -71,6 +71,12 @@ impl SortKey {
     }
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum Hit {
+    Thing,
+    Empty,
+}
+
 /// Shared state the cell factories read while binding.
 #[derive(Default)]
 struct Look {
@@ -445,6 +451,16 @@ impl Files {
                     act(id);
                     return glib::Propagation::Stop;
                 }
+                if key == gdk::Key::Escape && mods.is_empty() {
+                    p.files.vim.borrow_mut().reset();
+                    if w.filter_entry.text().is_empty() {
+                        p.files.selection.unselect_all();
+                        p.files.cursor.set(None);
+                    } else {
+                        w.filter_entry.set_text("");
+                    }
+                    return glib::Propagation::Stop;
+                }
                 let plain = !mods.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK);
                 if let Some(c) = key.to_unicode().filter(|c| plain && !c.is_control() && !c.is_whitespace()) {
                     if w.cfg.borrow().view.vim_keys {
@@ -481,18 +497,57 @@ impl Files {
             });
             view.add_controller(click);
 
-            // a left click on an empty/error page gives the area focus (for Ctrl+V etc.)
-            let focus = gtk::GestureClick::new();
+            // The views' own rubberband takes every drag, also ones that start on a file, so
+            // drag and drop never got a chance. Decide before they see the press: on a file
+            // no rubberband, on empty space yes.
+            let press = gtk::GestureClick::new();
+            press.set_propagation_phase(gtk::PropagationPhase::Capture);
             let weak = Rc::downgrade(pane);
-            focus.connect_released(move |_, _, _, _| {
+            press.connect_pressed(move |_, _, x, y| {
                 if let Some(p) = weak.upgrade() {
-                    if !p.files.showing_view() {
-                        p.files.widget.grab_focus();
-                    }
+                    let on = p.files.hit(x, y) == Hit::Empty;
+                    p.files.grid.set_enable_rubberband(on);
+                    p.files.compact.set_enable_rubberband(on);
+                    p.files.list.set_enable_rubberband(on);
                 }
             });
-            view.add_controller(focus);
+            view.add_controller(press);
+
+            // a left click on empty space unselects, and gives the area focus (for Ctrl+V etc.)
+            let empty = gtk::GestureClick::new();
+            let weak = Rc::downgrade(pane);
+            empty.connect_released(move |g, _, x, y| {
+                let Some(p) = weak.upgrade() else { return };
+                let f = &p.files;
+                if !f.showing_view() {
+                    f.widget.grab_focus();
+                    return;
+                }
+                let adding = g.current_event_state().intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
+                if !adding && f.hit(x, y) == Hit::Empty {
+                    f.selection.unselect_all();
+                    f.cursor.set(None);
+                    f.grab_focus();
+                }
+            });
+            view.add_controller(empty);
         }
+    }
+
+    /// What's under the pointer (coordinates of the whole file area).
+    fn hit(&self, x: f64, y: f64) -> Hit {
+        let mut w = self.widget.pick(x, y, gtk::PickFlags::DEFAULT);
+        while let Some(c) = w {
+            // a tile, a list row, a column header, a scrollbar
+            if c.has_css_class("cell") || matches!(c.css_name().as_str(), "child" | "row" | "header" | "scrollbar" | "button") {
+                return Hit::Thing;
+            }
+            if c == *self.widget.upcast_ref::<gtk::Widget>() {
+                break;
+            }
+            w = c.parent();
+        }
+        Hit::Empty
     }
 
     pub fn mode(&self) -> Mode {
@@ -970,6 +1025,8 @@ fn item_icon(info: &gio::FileInfo, look: &Look) -> gio::Icon {
 
 /// Right-click menu, middle-click (open in new tab) and drag source for one cell.
 fn attach_cell(w: &gtk::Widget, li: &gtk::ListItem, pane: &Rc<RefCell<Weak<Pane>>>) {
+    // the cell carries the tile's padding, so its edges can be grabbed too
+    w.add_css_class("cell");
     let click = gtk::GestureClick::new();
     click.set_button(0);
     let (liw, pw) = (li.downgrade(), pane.clone());
