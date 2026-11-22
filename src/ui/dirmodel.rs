@@ -153,6 +153,13 @@ impl DirModel {
         });
     }
 
+    /// Show an error that happened outside listing (e.g. connecting failed).
+    pub fn set_error(&self, e: glib::Error) {
+        *self.error.borrow_mut() = Some(e);
+        self.loading.set(false);
+        self.state_changed();
+    }
+
     pub fn reload(self: &Rc<Self>) {
         let f = self.file();
         self.set_file(f.as_ref());

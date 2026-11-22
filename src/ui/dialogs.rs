@@ -5,7 +5,7 @@ use gtk::{gdk, gio, glib};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-fn dialog_window(parent: &gtk::Window, title: &str, width: i32) -> (gtk::Window, gtk::Box) {
+pub(super) fn dialog_window(parent: &gtk::Window, title: &str, width: i32) -> (gtk::Window, gtk::Box) {
     let win = gtk::Window::builder()
         .transient_for(parent)
         .modal(true)
@@ -38,7 +38,7 @@ fn dialog_window(parent: &gtk::Window, title: &str, width: i32) -> (gtk::Window,
     (win, root)
 }
 
-fn button_row(root: &gtk::Box, ok_label: &str) -> (gtk::Button, gtk::Button) {
+pub(super) fn button_row(root: &gtk::Box, ok_label: &str) -> (gtk::Button, gtk::Button) {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row.set_halign(gtk::Align::End);
     row.set_margin_top(4);

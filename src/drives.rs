@@ -53,6 +53,10 @@ pub fn key_for(volume: Option<&gio::Volume>, mount: Option<&gio::Mount>) -> Stri
                 }
             }
         }
+        // phones and cameras: the USB device path changes on every replug, the address doesn't
+        if let Some(r) = v.activation_root().filter(|r| !r.is_native()) {
+            return format!("uri:{}", r.uri());
+        }
         if let Some(d) = v.identifier(gio::VOLUME_IDENTIFIER_KIND_UNIX_DEVICE) {
             return format!("dev:{d}");
         }
@@ -69,6 +73,10 @@ pub fn key_for(volume: Option<&gio::Volume>, mount: Option<&gio::Mount>) -> Stri
 
 fn kind_of(volume: Option<&gio::Volume>, mount: Option<&gio::Mount>) -> Kind {
     let root = mount.map(|m| m.root());
+    let scheme = root.clone().or_else(|| volume.and_then(|v| v.activation_root())).and_then(|r| r.uri_scheme());
+    if scheme.as_deref().is_some_and(is_device_scheme) {
+        return Kind::Removable;
+    }
     if root.as_ref().is_some_and(|r| !r.is_native()) {
         return Kind::Network;
     }
@@ -86,6 +94,11 @@ fn kind_of(volume: Option<&gio::Volume>, mount: Option<&gio::Mount>) -> Kind {
     } else {
         Kind::Internal
     }
+}
+
+/// Phones (MTP, Apple) and cameras: plugged-in devices that GVFS shows as addresses.
+pub fn is_device_scheme(s: &str) -> bool {
+    matches!(s, "mtp" | "gphoto2" | "afc")
 }
 
 /// Everything the sidebar should show: the root filesystem, every volume (mounted or not),

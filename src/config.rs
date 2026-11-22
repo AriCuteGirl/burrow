@@ -56,6 +56,8 @@ pub struct ViewCfg {
     pub icon_size: u32,
     /// Show the "Drives" overview page in the sidebar
     pub drives_page: bool,
+    /// Show the "Network" page in the sidebar
+    pub network_page: bool,
     /// "name", "size", "modified" or "type"
     pub sort: String,
     pub sort_desc: bool,
@@ -133,6 +135,7 @@ impl Default for ViewCfg {
             folders_first: true,
             icon_size: 64,
             drives_page: true,
+            network_page: true,
             sort: "name".into(),
             sort_desc: false,
         }
@@ -234,6 +237,17 @@ impl Config {
             }
             if s.accent.as_deref().is_some_and(|a| crate::theme::Rgb::parse(a).is_none()) {
                 s.accent = None;
+            }
+        }
+        // passwords never live in this file, even if someone pastes an address with one
+        for s in &mut self.sections {
+            for it in &mut s.items {
+                if let Item::Folder { path, .. } = it {
+                    let (clean, had) = crate::net::strip_password(path);
+                    if had {
+                        *path = clean;
+                    }
+                }
             }
         }
         // a drive key may only live in one section
@@ -354,6 +368,13 @@ hidden = true
             Item::Folder { label, .. } => assert_eq!(label.as_deref(), Some("My games")),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn passwords_never_stay_in_the_config() {
+        let c = Config::parse("[[section]]\nid='a'\nname='A'\nitems=[{kind='folder',path='smb://ari:hunter2@nas/x'}]\n").unwrap();
+        assert!(matches!(&c.sections[0].items[0], Item::Folder { path, .. } if path == "smb://ari@nas/x"));
+        assert!(!c.to_toml().contains("hunter2"));
     }
 
     #[test]

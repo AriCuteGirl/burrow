@@ -108,8 +108,13 @@ impl Pathbar {
     }
 
     pub fn set_drives(&self) {
+        self.set_place("Drives", "computer-symbolic");
+    }
+
+    /// A page that isn't a folder (Drives, Network).
+    pub fn set_place(&self, name: &str, icon: &str) {
         self.clear();
-        let b = crumb("Drives", Some("computer-symbolic"), true);
+        let b = crumb(name, Some(icon), true);
         self.crumbs.append(&b);
         self.entry.set_text("");
     }

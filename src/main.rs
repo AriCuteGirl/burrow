@@ -1,8 +1,10 @@
 mod archive;
 mod config;
 mod drives;
+mod net;
 mod ops;
 mod rename;
+mod share;
 mod theme;
 mod transfer;
 mod ui;
@@ -14,9 +16,14 @@ use gtk::prelude::*;
 pub const APP_ID: &str = "world.puppygirl.Burrow";
 
 fn main() -> gtk::glib::ExitCode {
+    let mut flags = gio::ApplicationFlags::HANDLES_OPEN;
+    // For testing a second copy next to the one in use (it would otherwise hand over to it)
+    if std::env::var_os("BURROW_NON_UNIQUE").is_some() {
+        flags |= gio::ApplicationFlags::NON_UNIQUE;
+    }
     let app = gtk::Application::builder()
         .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::HANDLES_OPEN)
+        .flags(flags)
         .build();
     app.connect_startup(|_| ui::startup());
     app.connect_activate(|app| ui::open_window(app, None));

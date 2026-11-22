@@ -15,7 +15,7 @@ use std::rc::{Rc, Weak};
 const ATTRS: &str = "standard::name,standard::display-name,standard::icon,standard::type,\
 standard::is-hidden,standard::is-backup,standard::is-symlink,standard::size,standard::content-type,\
 time::modified,thumbnail::path,thumbnail::is-valid,access::can-read,access::can-trash,access::can-delete,\
-trash::orig-path,trash::deletion-date,standard::symlink-target";
+trash::orig-path,trash::deletion-date,standard::symlink-target,standard::target-uri";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -103,10 +103,27 @@ pub struct Files {
     empty_text: gtk::Label,
     skeleton: gtk::FlowBox,
     skeleton_timer: RefCell<Option<glib::SourceId>>,
+    connecting: Cell<bool>,
+    connecting_title: gtk::Label,
 }
 
 pub fn info_file(info: &gio::FileInfo) -> Option<gio::File> {
     info.attribute_object("standard::file").and_downcast::<gio::File>()
+}
+
+/// Folders, plus shares on a server (which only point at the real address).
+pub fn is_folder(info: &gio::FileInfo) -> bool {
+    matches!(info.file_type(), gio::FileType::Directory | gio::FileType::Mountable)
+}
+
+/// The location to open for an entry: a share's real address, else the file itself.
+pub fn open_target(info: &gio::FileInfo) -> Option<gio::File> {
+    if matches!(info.file_type(), gio::FileType::Mountable | gio::FileType::Shortcut) {
+        if let Some(u) = info.attribute_string("standard::target-uri") {
+            return Some(gio::File::for_uri(&u));
+        }
+    }
+    info_file(info)
 }
 
 /// Config key for a folder: "~/x" for local paths, the URI otherwise.
@@ -144,7 +161,7 @@ impl Files {
             let (Some(a), Some(b)) = (a.downcast_ref::<gio::FileInfo>(), b.downcast_ref::<gio::FileInfo>()) else {
                 return gtk::Ordering::Equal;
             };
-            let is_dir = |i: &gio::FileInfo| i.file_type() == gio::FileType::Directory;
+            let is_dir = is_folder;
             let first = if ff.get() { is_dir(b).cmp(&is_dir(a)) } else { std::cmp::Ordering::Equal };
             let name = || util::natural_cmp(&a.display_name(), &b.display_name());
             let key = match sk.get() {
@@ -251,6 +268,19 @@ impl Files {
         error.append(&btns);
         widget.add_named(&error, Some("error"));
 
+        // logging in to a server
+        let (conn, _, connecting_title, conn_text) = state_page("network-server-symbolic");
+        conn_text.set_text("This can take a moment.");
+        let spin = gtk::Spinner::new();
+        spin.start();
+        conn.append(&spin);
+        let stop = gtk::Button::with_label("Cancel");
+        stop.add_css_class("secondary");
+        stop.set_halign(gtk::Align::Center);
+        stop.set_action_name(Some("win.cancel-connect"));
+        conn.append(&stop);
+        widget.add_named(&conn, Some("connecting"));
+
         let f = Files {
             widget,
             dir,
@@ -277,6 +307,8 @@ impl Files {
             empty_text,
             skeleton,
             skeleton_timer: RefCell::new(None),
+            connecting: Cell::new(false),
+            connecting_title,
         };
         f.set_folder_icons(cfg);
         f.sync_list_sort_indicator();
@@ -567,9 +599,29 @@ impl Files {
         }
     }
 
+    /// Show "Connecting to …" instead of the folder (None = back to normal).
+    pub fn set_connecting(&self, name: Option<&str>) {
+        self.connecting.set(name.is_some());
+        if let Some(n) = name {
+            self.connecting_title.set_text(&format!("Connecting to {n}…"));
+            self.widget.set_visible_child_name("connecting");
+        }
+    }
+
+    pub fn fail(&self, e: glib::Error) {
+        self.dir.set_error(e);
+    }
+
     pub fn update_state(&self, p: &Rc<Pane>) {
         if let Some(id) = self.skeleton_timer.borrow_mut().take() {
             id.remove();
+        }
+        if self.connecting.get() {
+            return;
+        }
+        // a server we aren't logged in to yet: connect instead of showing an error
+        if self.dir.error().is_some_and(|e| e.matches(gio::IOErrorEnum::NotMounted)) && p.try_mount() {
+            return;
         }
         let n = self.filtered.n_items();
         let view = self.mode.get().name();
@@ -666,7 +718,7 @@ impl Files {
         let mut folders = 0u32;
         for i in 0..n.min(20_000) {
             if let Some(info) = self.filtered.item(i).and_downcast::<gio::FileInfo>() {
-                if info.file_type() == gio::FileType::Directory {
+                if is_folder(&info) {
                     folders += 1;
                 }
             }
@@ -684,7 +736,7 @@ impl Files {
         if !sel.is_empty() {
             let bytes: u64 = sel
                 .iter()
-                .filter(|i| i.file_type() != gio::FileType::Directory)
+                .filter(|i| !is_folder(i))
                 .map(|i| i.size().max(0) as u64)
                 .sum();
             out.push_str(&format!(" · {} selected ({})", sel.len(), util::human_size(bytes)));
@@ -696,7 +748,7 @@ impl Files {
 // ---------------------------------------------------------------- cells
 
 fn item_icon(info: &gio::FileInfo, look: &Look) -> gio::Icon {
-    let is_dir = info.file_type() == gio::FileType::Directory;
+    let is_dir = is_folder(info);
     if is_dir && !look.folder_icons.borrow().is_empty() {
         if let Some(f) = info_file(info) {
             if let Some(i) = look.folder_icons.borrow().get(&folder_key(&f)) {
@@ -991,7 +1043,7 @@ fn list_factory(col: &'static str, look: &Rc<Look>, pane: &Rc<RefCell<Weak<Pane>
         let Some(info) = li.item().and_downcast::<gio::FileInfo>() else { return };
         let Some(hb) = li.child().and_downcast::<gtk::Box>() else { return };
         let lbl = hb.last_child().and_downcast::<gtk::Label>().unwrap();
-        let is_dir = info.file_type() == gio::FileType::Directory;
+        let is_dir = is_folder(&info);
         let text = match col {
             "name" => {
                 if let Some(img) = hb.first_child().and_downcast::<gtk::Image>() {
@@ -1061,6 +1113,12 @@ fn describe_error(e: &glib::Error) -> (&'static str, &'static str, String) {
         || e.matches(E::NetworkUnreachable)
     {
         ("network-offline-symbolic", "Location unavailable", format!("The network location can't be reached. {}", e.message()))
+    } else if e.matches(E::FailedHandled) {
+        ("network-offline-symbolic", "Not connected", "The login was cancelled.".into())
+    } else if e.matches(E::Cancelled) {
+        ("network-offline-symbolic", "Not connected", "Connecting was cancelled.".into())
+    } else if e.matches(E::NotSupported) {
+        ("network-offline-symbolic", "Can't open this kind of address", "This computer's network layer (GVFS) has no support for it.".into())
     } else if e.matches(E::NotDirectory) {
         ("text-x-generic-symbolic", "Not a folder", "This location is a file, not a folder.".into())
     } else {

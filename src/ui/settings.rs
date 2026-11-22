@@ -28,6 +28,7 @@ pub struct Settings {
     folders_first: gtk::Switch,
     icon_size: gtk::Scale,
     drives_page: gtk::Switch,
+    network_page: gtk::Switch,
     sort: gtk::DropDown,
     sort_desc: gtk::Switch,
 }
@@ -193,6 +194,8 @@ impl Settings {
         row(&g, "Show hidden files", "Ctrl+H toggles it anywhere", &show_hidden);
         let drives_page = gtk::Switch::new();
         row(&g, "Drives page in the sidebar", "The overview with a usage bar per drive", &drives_page);
+        let network_page = gtk::Switch::new();
+        row(&g, "Network page in the sidebar", "Servers, other computers, and what you share", &network_page);
 
         // ---------------- footer
         let foot = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -225,6 +228,7 @@ impl Settings {
             folders_first,
             icon_size,
             drives_page,
+            network_page,
             sort,
             sort_desc,
         };
@@ -334,6 +338,7 @@ impl Settings {
             (&self.folders_first, |c, v| c.view.folders_first = v),
             (&self.show_hidden, |c, v| c.view.show_hidden = v),
             (&self.drives_page, |c, v| c.view.drives_page = v),
+            (&self.network_page, |c, v| c.view.network_page = v),
         ] {
             let e = edit.clone();
             sw.connect_active_notify(move |s| {
@@ -437,6 +442,7 @@ impl Settings {
         self.folders_first.set_active(c.view.folders_first);
         self.show_hidden.set_active(c.view.show_hidden);
         self.drives_page.set_active(c.view.drives_page);
+        self.network_page.set_active(c.view.network_page);
         self.syncing.set(false);
     }
 }

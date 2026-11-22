@@ -18,6 +18,7 @@ const DND_PREFIX: &str = "burrow-side:";
 #[derive(Clone)]
 enum Target {
     DrivesPage,
+    NetworkPage,
     Folder { file: gio::File, section: usize, item: usize },
     Drive { key: String, root: Option<gio::File>, section: usize },
 }
@@ -27,6 +28,7 @@ impl Target {
     fn id(&self) -> String {
         match self {
             Target::DrivesPage => "p".into(),
+            Target::NetworkPage => "n".into(),
             Target::Folder { section, item, .. } => format!("f:{section}:{item}"),
             Target::Drive { key, .. } => format!("d:{key}"),
         }
@@ -88,11 +90,19 @@ impl Sidebar {
         let cfg = w.cfg.borrow().clone();
         let drives = w.drives.borrow().clone();
 
+        let mut pages = vec![];
+        let list = self.new_list(w);
         if cfg.view.drives_page {
-            let list = self.new_list(w);
             list.append(&row(&gio::ThemedIcon::new("computer-symbolic").upcast(), "Drives", None));
+            pages.push(Target::DrivesPage);
+        }
+        if cfg.view.network_page {
+            list.append(&row(&gio::ThemedIcon::new("network-workgroup-symbolic").upcast(), "Network", None));
+            pages.push(Target::NetworkPage);
+        }
+        if !pages.is_empty() {
             self.body.append(&list);
-            self.lists.borrow_mut().push((list, Rc::new(vec![Target::DrivesPage])));
+            self.lists.borrow_mut().push((list, Rc::new(pages)));
         }
 
         for (si, s) in cfg.sections.iter().enumerate() {
@@ -297,6 +307,7 @@ impl Sidebar {
             let Some(t) = w.sidebar.target_of(l, r) else { return };
             match t {
                 Target::DrivesPage => w.go(Loc::Drives, true),
+                Target::NetworkPage => w.go(Loc::Network, true),
                 Target::Folder { file, .. } => w.go(Loc::Files(file), true),
                 Target::Drive { key, .. } => w.open_drive(&key),
             }
@@ -353,7 +364,7 @@ impl Sidebar {
         // drop on a row: insert before it (top half) or after it (bottom half)
         let section = match tgt {
             Target::Folder { section, .. } | Target::Drive { section, .. } => *section,
-            Target::DrivesPage => return,
+            Target::DrivesPage | Target::NetworkPage => return,
         };
         let drop = drop_target();
         let rw = r.downgrade();
@@ -451,7 +462,7 @@ impl Sidebar {
     pub fn sync_selection(&self, loc: &Loc) {
         for (list, targets) in self.lists.borrow().iter() {
             let hit = targets.iter().position(|t| match (t, loc) {
-                (Target::DrivesPage, Loc::Drives) => true,
+                (Target::DrivesPage, Loc::Drives) | (Target::NetworkPage, Loc::Network) => true,
                 (Target::Folder { file, .. }, Loc::Files(l)) => file.equal(l),
                 (Target::Drive { root: Some(r), .. }, Loc::Files(l)) => r.equal(l),
                 _ => false,
@@ -653,7 +664,12 @@ fn visible_rows(cfg: &Config, si: usize, drives: &[Drive]) -> Vec<VRow> {
         for d in drives {
             let auto_here = cfg.section_for_drive(&d.key) == Some(s.id.as_str());
             let explicit = s.items.iter().any(|i| matches!(i, Item::Drive { key } if *key == d.key));
-            if auto_here && !explicit && !cfg.drive(&d.key).hidden {
+            // a connected server that's already pinned somewhere isn't listed a second time
+            let pinned = d.kind == drives::Kind::Network
+                && d.root.as_ref().is_some_and(|r| {
+                    cfg.sections.iter().flat_map(|s| &s.items).any(|i| matches!(i, Item::Folder { path, .. } if crate::net::is_network_uri(path) && file_from_config_path(path).equal(r)))
+                });
+            if auto_here && !explicit && !pinned && !cfg.drive(&d.key).hidden {
                 out.push(VRow::Drive(d.clone()));
             }
         }
@@ -848,7 +864,7 @@ fn row_menu(w: &Rc<Win>, t: &Target) -> gio::Menu {
     let m = gio::Menu::new();
     let open = gio::Menu::new();
     match t {
-        Target::DrivesPage => {}
+        Target::DrivesPage | Target::NetworkPage => {}
         Target::Folder { section, item, .. } => {
             open.append(Some("Open in new tab"), Some(&action("win.side-open-tab", &id)));
             m.append_section(None, &open);
@@ -881,7 +897,7 @@ fn row_menu(w: &Rc<Win>, t: &Target) -> gio::Menu {
             m.append_section(None, &edit);
         }
     }
-    if !matches!(t, Target::DrivesPage) {
+    if !matches!(t, Target::DrivesPage | Target::NetworkPage) {
         let order = gio::Menu::new();
         order.append(Some("Move up"), Some(&action("win.side-up", &id)));
         order.append(Some("Move down"), Some(&action("win.side-down", &id)));

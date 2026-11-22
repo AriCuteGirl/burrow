@@ -2,12 +2,13 @@
 //! A tab holds one pane, or two side by side in split view.
 
 use super::drives_page::DrivesPage;
+use super::network_page::NetworkPage;
 use super::files::{self, Files, Mode};
 use super::pathbar::Pathbar;
 use super::{Loc, Win, display_name};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 pub struct Pane {
@@ -16,6 +17,10 @@ pub struct Pane {
     pub files: Files,
     pub pathbar: Pathbar,
     pub drives_page: DrivesPage,
+    pub network_page: Rc<NetworkPage>,
+    /// One automatic login attempt per visit; Try again resets it.
+    mount_tried: Cell<bool>,
+    mount_cancel: RefCell<Option<gio::Cancellable>>,
     content: gtk::Stack,
     trash_bar: gtk::Revealer,
     trash_text: gtk::Label,
@@ -84,8 +89,10 @@ impl Pane {
         content.set_transition_type(gtk::StackTransitionType::Crossfade);
         let files = Files::new(&w.cfg.borrow());
         let drives_page = DrivesPage::new();
+        let network_page = Rc::new(NetworkPage::new());
         content.add_named(&files.widget, Some("files"));
         content.add_named(&drives_page.widget, Some("drives"));
+        content.add_named(&network_page.widget, Some("network"));
         widget.append(&content);
 
         let p = Rc::new(Pane {
@@ -94,6 +101,9 @@ impl Pane {
             files,
             pathbar,
             drives_page,
+            network_page,
+            mount_tried: Cell::new(false),
+            mount_cancel: RefCell::new(None),
             content,
             trash_bar,
             trash_text,
@@ -174,6 +184,7 @@ impl Pane {
         match &*self.loc.borrow() {
             Loc::Files(f) => display_name(f, &gio::File::for_path(glib::home_dir())),
             Loc::Drives => "Drives".into(),
+            Loc::Network => "Network".into(),
         }
     }
 
@@ -189,6 +200,8 @@ impl Pane {
             }
         }
         *self.loc.borrow_mut() = loc.clone();
+        self.cancel_mount();
+        self.mount_tried.set(false);
         match &loc {
             Loc::Files(f) => {
                 // per-folder view, else the default
@@ -209,6 +222,11 @@ impl Pane {
                 self.content.set_visible_child_name("drives");
                 self.pathbar.set_drives();
                 self.drives_page.refresh_usage();
+            }
+            Loc::Network => {
+                self.content.set_visible_child_name("network");
+                self.pathbar.set_place("Network", "network-workgroup-symbolic");
+                self.network_page.refresh(&w);
             }
         }
         self.update_nav();
@@ -237,7 +255,7 @@ impl Pane {
     pub fn go_up(self: &Rc<Self>) {
         let p = match &*self.loc.borrow() {
             Loc::Files(f) => f.parent(),
-            Loc::Drives => None,
+            _ => None,
         };
         if let Some(p) = p {
             self.go(Loc::Files(p), true);
@@ -245,9 +263,61 @@ impl Pane {
     }
     pub fn reload(self: &Rc<Self>) {
         match &*self.loc.borrow() {
-            Loc::Files(_) => self.files.reload(),
+            Loc::Files(_) => {
+                self.cancel_mount();
+                self.mount_tried.set(false);
+                self.files.reload();
+            }
             Loc::Drives => self.drives_page.refresh_usage(),
+            Loc::Network => {
+                if let Some(w) = self.win() {
+                    self.network_page.refresh(&w);
+                }
+            }
         }
+    }
+
+    // ------------------------------------------------------------------ servers
+    /// Connect to the server this location is on. False if we already tried.
+    pub fn try_mount(self: &Rc<Self>) -> bool {
+        let (Some(f), Some(w)) = (self.current_file(), self.win()) else { return false };
+        if f.is_native() || self.mount_tried.replace(true) {
+            return false;
+        }
+        let cancel = gio::Cancellable::new();
+        *self.mount_cancel.borrow_mut() = Some(cancel.clone());
+        self.files.set_connecting(Some(&display_name(&f, &w.home)));
+        let weak = Rc::downgrade(self);
+        let (f2, c2) = (f.clone(), cancel.clone());
+        f.mount_enclosing_volume(gio::MountMountFlags::NONE, Some(&super::connect::mount_op(&w)), Some(&cancel), move |r| {
+            let Some(p) = weak.upgrade() else { return };
+            // the user has moved on (or pressed Cancel, which already showed its page)
+            let here = p.mount_cancel.borrow().as_ref().is_some_and(|c| *c == c2) && p.current_file().is_some_and(|x| x.equal(&f2));
+            if !here {
+                return;
+            }
+            *p.mount_cancel.borrow_mut() = None;
+            p.files.set_connecting(None);
+            match r {
+                Ok(()) => p.files.reload(),
+                Err(e) if e.matches(gio::IOErrorEnum::AlreadyMounted) => p.files.reload(),
+                Err(e) => p.files.fail(e),
+            }
+        });
+        true
+    }
+
+    fn cancel_mount(&self) {
+        if let Some(c) = self.mount_cancel.borrow_mut().take() {
+            c.cancel();
+        }
+        self.files.set_connecting(None);
+    }
+
+    /// The Cancel button on the "Connecting…" page.
+    pub fn stop_connecting(&self) {
+        self.cancel_mount();
+        self.files.fail(glib::Error::new(gio::IOErrorEnum::Cancelled, "cancelled"));
     }
 
     pub fn in_trash(&self) -> bool {
@@ -270,7 +340,7 @@ impl Pane {
     pub fn current_file(&self) -> Option<gio::File> {
         match &*self.loc.borrow() {
             Loc::Files(f) => Some(f.clone()),
-            Loc::Drives => None,
+            _ => None,
         }
     }
 
@@ -319,6 +389,10 @@ impl Pane {
                 let n = self.drives_page.count.get();
                 format!("{n} drive{}", if n == 1 { "" } else { "s" })
             }
+            Loc::Network => {
+                let n = self.network_page.count.get();
+                format!("{n} location{}", if n == 1 { "" } else { "s" })
+            }
             Loc::Files(_) => self.files.status_text(),
         }
     }
@@ -335,7 +409,12 @@ impl Pane {
     pub fn activate_item(self: &Rc<Self>, pos: u32) {
         let Some(info) = self.files.item(pos) else { return };
         let Some(f) = files::info_file(&info) else { return };
-        if matches!(info.file_type(), gio::FileType::Directory | gio::FileType::Mountable) {
+        // shares on a server: the entry only points at the real address
+        if matches!(info.file_type(), gio::FileType::Mountable | gio::FileType::Shortcut) {
+            self.go(Loc::Files(files::open_target(&info).unwrap_or(f)), true);
+            return;
+        }
+        if info.file_type() == gio::FileType::Directory {
             // a shortcut (symlink) to a folder opens the real folder, like Windows
             let f = symlink_target(&info, &f).unwrap_or(f);
             self.go(Loc::Files(f), true);
@@ -346,8 +425,8 @@ impl Pane {
 
     pub fn open_item_in_new_tab(self: &Rc<Self>, pos: u32) {
         let Some(info) = self.files.item(pos) else { return };
-        let (Some(f), Some(w)) = (files::info_file(&info), self.win()) else { return };
-        if info.file_type() == gio::FileType::Directory {
+        let (Some(f), Some(w)) = (files::open_target(&info), self.win()) else { return };
+        if files::is_folder(&info) {
             w.new_tab(Loc::Files(f), false);
         }
     }
@@ -367,9 +446,9 @@ impl Pane {
         let Some(w) = self.win() else { return };
         let sel = self.files.selected_infos();
         let Some(first) = sel.first() else { return };
-        let Some(f) = files::info_file(first) else { return };
+        let Some(f) = files::open_target(first) else { return };
         let uri = f.uri().to_string();
-        let is_dir = first.file_type() == gio::FileType::Directory;
+        let is_dir = files::is_folder(first);
         let menu = gio::Menu::new();
         let open = gio::Menu::new();
         open.append(Some("Open"), Some(&action("win.open-uri", &uri)));
@@ -417,6 +496,9 @@ impl Pane {
                 pin.append(Some(&s.name), Some(&format!("win.pin(('{}','{}'))", esc(&uri), esc(&s.id))));
             }
             side.append_submenu(Some("Pin to sidebar"), &pin);
+            if f.is_native() && !self.in_trash() {
+                side.append(Some("Share on the network…"), Some(&action("win.share", &uri)));
+            }
             side.append(Some("Change folder icon…"), Some(&action("win.folder-icon", &uri)));
             if w.cfg.borrow().folders.get(&files::folder_key(&f)).is_some_and(|c| c.icon.is_some()) {
                 side.append(Some("Reset folder icon"), Some(&action("win.folder-icon-reset", &uri)));
@@ -478,6 +560,7 @@ impl Pane {
             edit.append_submenu(Some("New"), &new);
             edit.append(Some("Paste"), Some("win.paste"));
             if f.is_native() {
+                edit.append(Some("Share on the network…"), Some(&action("win.share", &uri)));
                 edit.append(Some("Open terminal here"), Some(&action("win.terminal", &uri)));
             }
             menu.append_section(None, &edit);

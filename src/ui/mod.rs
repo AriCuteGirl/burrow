@@ -3,6 +3,7 @@
 
 mod apps;
 mod batch;
+mod connect;
 mod archives;
 mod create;
 mod dialogs;
@@ -10,10 +11,12 @@ mod dirmodel;
 mod drives_page;
 mod files;
 mod jobs;
+mod network_page;
 mod pane;
 mod pathbar;
 mod properties;
 mod settings;
+mod share_ui;
 mod sidebar;
 
 use crate::config::{self, Config, Item};
@@ -31,13 +34,14 @@ use std::time::Duration;
 pub enum Loc {
     Files(gio::File),
     Drives,
+    Network,
 }
 
 impl Loc {
     fn same(&self, o: &Loc) -> bool {
         match (self, o) {
             (Loc::Files(a), Loc::Files(b)) => a.equal(b),
-            (Loc::Drives, Loc::Drives) => true,
+            (Loc::Drives, Loc::Drives) | (Loc::Network, Loc::Network) => true,
             _ => false,
         }
     }
@@ -281,6 +285,7 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     split_btn.add_css_class("flat-btn");
     topbar.append(&split_btn);
     let menu = gio::Menu::new();
+    menu.append(Some("Connect to server…"), Some("win.connect"));
     menu.append(Some("Settings"), Some("win.settings"));
     menu.append(Some("Open config file"), Some("win.open-config"));
     let sec = gio::Menu::new();
@@ -845,6 +850,9 @@ impl Win {
         for p in self.all_panes() {
             p.files.config_changed(&cfg);
             p.drives_page.rebuild(self);
+            if matches!(&*p.loc.borrow(), Loc::Network) {
+                p.network_page.rebuild(self);
+            }
         }
         self.sync_toolbar();
         self.sidebar.rebuild(self);
@@ -941,6 +949,9 @@ impl Win {
         self.sidebar.rebuild(self);
         for p in self.all_panes() {
             p.drives_page.rebuild(self);
+            if matches!(&*p.loc.borrow(), Loc::Network) {
+                p.network_page.rebuild(self);
+            }
         }
     }
 
@@ -1095,6 +1106,9 @@ impl Win {
             w.reload_drives();
         }));
         add("drives", &["<Ctrl>d"], Box::new(|w| w.go(Loc::Drives, true)));
+        add("network", &["<Ctrl><Shift>d"], Box::new(|w| w.go(Loc::Network, true)));
+        add("connect", &["<Ctrl><Shift>k"], Box::new(|w| w.connect_dialog()));
+        add("cancel-connect", &[], Box::new(|w| w.active().stop_connecting()));
         add("new-tab", &["<Ctrl>t"], Box::new(|w| {
             let loc = w.active_loc();
             w.new_tab(loc, true);
@@ -1233,6 +1247,7 @@ impl Win {
                 w.choose_app(files, ctype);
             }
         }));
+        add_s("share", Box::new(|w, uri| w.share_dialog(gio::File::for_uri(&uri))));
         add_s("paste-into", Box::new(|w, uri| w.paste_into(gio::File::for_uri(&uri))));
         add_s("view-mode", Box::new(|w, m| w.active().set_mode(Mode::parse(&m))));
         add_s("folder-icon", Box::new(|w, uri| {
@@ -1337,9 +1352,33 @@ pub fn display_name(f: &gio::File, home: &gio::File) -> String {
             if f.is_native() {
                 "File System".into()
             } else {
-                f.uri().to_string()
+                net_name(&f.uri())
             }
         }
+    }
+}
+
+/// "smb://ari@nas/media/" -> "media on nas", "sftp://pi/" -> "pi"
+pub fn net_name(uri: &str) -> String {
+    let Some((_, rest)) = uri.split_once("://") else { return uri.to_string() };
+    let (auth, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = auth.rsplit('@').next().unwrap_or(auth);
+    let last = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let last = glib::Uri::unescape_string(last, None).map(|s| s.to_string()).unwrap_or_else(|| last.to_string());
+    match (host.is_empty(), last.is_empty()) {
+        (false, true) => host.to_string(),
+        (false, false) => format!("{last} on {host}"),
+        _ => uri.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn network_titles() {
+        assert_eq!(super::net_name("smb://ari@nas/My%20Films/"), "My Films on nas");
+        assert_eq!(super::net_name("sftp://pi:2222/"), "pi:2222");
+        assert_eq!(super::net_name("network:///"), "network:///");
     }
 }
 
