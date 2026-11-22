@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build Burrow and install it for the current user (no root). ./install.sh --uninstall removes it.
+# Install Burrow for the current user (no root): the binary next to this script if there is one
+# (release download), else a fresh build. ./install.sh --uninstall removes it.
 # Your settings in ~/.config/burrow are never touched, and it doesn't become the default by itself.
 set -eu
 cd "$(dirname "$0")"
@@ -11,8 +12,13 @@ if [ "${1:-}" = "--uninstall" ]; then
     echo "Burrow removed."
     exit 0
 fi
-cargo build --release
-install -Dm755 target/release/burrow "$BIN/burrow"
+if [ -f burrow ]; then
+    SRC=burrow
+else
+    cargo build --release
+    SRC=target/release/burrow
+fi
+install -Dm755 "$SRC" "$BIN/burrow"
 install -Dm644 "data/icons/hicolor/scalable/apps/$ID.svg" "$DATA/icons/hicolor/scalable/apps/$ID.svg"
 mkdir -p "$DATA/applications"
 # xdg-mime and xdg-open don't understand a quoted program, so quote only if the path needs it

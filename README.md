@@ -21,11 +21,17 @@ Rust and plain GTK4 (no libadwaita), three dependencies, about 5 MB.
 - **Yours:** every shortcut, vim keys, right-click actions, one readable config file
 
 ## Install
-Needs Rust, GTK 4.18+ and a C compiler. For everything to work (Arch names):
+Needs GTK 4.18+. For everything to work (Arch names):
 
 ```bash
-sudo pacman -S --needed git rust base-devel gtk4 gvfs gvfs-smb gvfs-nfs gvfs-mtp udisks2 libarchive 7zip bubblewrap ffmpegthumbnailer poppler avahi
+sudo pacman -S --needed gtk4 gvfs gvfs-smb gvfs-nfs gvfs-mtp udisks2 libarchive 7zip bubblewrap ffmpegthumbnailer poppler avahi
 ```
+
+**Ready-made** (x86_64, glibc 2.39+): download the `.tar.gz` from
+[Releases](https://github.com/AriCuteGirl/burrow/releases/latest), unpack it and run
+`./install.sh` in its folder.
+
+**Build it yourself** (also needs `git rust base-devel`):
 
 ```bash
 git clone https://github.com/AriCuteGirl/burrow
