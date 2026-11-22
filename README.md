@@ -24,12 +24,16 @@ Rust and plain GTK4 (no libadwaita), three dependencies, about 5 MB.
 Needs Rust, GTK 4.18+ and a C compiler. For everything to work (Arch names):
 
 ```bash
-sudo pacman -S gvfs gvfs-smb gvfs-nfs gvfs-mtp udisks2 libarchive 7zip bubblewrap ffmpegthumbnailer poppler avahi
+sudo pacman -S --needed git rust base-devel gtk4 gvfs gvfs-smb gvfs-nfs gvfs-mtp udisks2 libarchive 7zip bubblewrap ffmpegthumbnailer poppler avahi
 ```
 
 ```bash
+git clone https://github.com/AriCuteGirl/burrow
+cd burrow
 ./install.sh
 ```
+
+The installer needs no root: everything goes into `~/.local`.
 
 `./install.sh --uninstall` removes it again. To make it the default file manager:
 
@@ -73,7 +77,9 @@ Actions run the program directly, never through a shell, so odd file names can't
 Placeholders: `%f` file, `%F` all files, `%d` folder, `%n` name, `%s` name without
 extension, `%u`/`%U` addresses.
 
-Without hypr-rice the built-in Lucid Blocks palette is used.
+A rice is a folder in `~/.local/share/hypr-rices/<id>/` with a `rice.json` (colours, Noctalia
+palette name) and `hypr/look.lua` (rounding, shadow); `~/.local/state/hypr-rices/current` holds
+the active id. Without one the built-in Lucid Blocks palette is used, so Burrow works anywhere.
 
 ## Safety
 Copies are written under a temporary name and renamed when complete; a move to another drive
