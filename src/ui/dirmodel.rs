@@ -219,7 +219,8 @@ impl DirModel {
     /// Query a child and insert it, or replace the existing entry with the same name.
     fn refresh_child(self: &Rc<Self>, child: &gio::File) {
         let Some(name) = child.basename().map(|b| b.to_string_lossy().to_string()) else { return };
-        if ignored(&name) {
+        // only things directly in this folder (a rename may have moved it elsewhere)
+        if ignored(&name) || !self.file().is_some_and(|d| child.has_parent(Some(&d))) {
             return;
         }
         let weak = Rc::downgrade(self);
@@ -246,6 +247,16 @@ impl DirModel {
 
     fn on_event(self: &Rc<Self>, file: &gio::File, other: Option<&gio::File>, ev: gio::FileMonitorEvent) {
         use gio::FileMonitorEvent as E;
+        let Some(dir) = self.file() else { return };
+        // The watcher also reports changes of the folder itself (the Trash does so every time
+        // its contents change). That's not an entry in it.
+        if dir.equal(file) {
+            if matches!(ev, E::Deleted | E::MovedOut | E::Unmounted) {
+                *self.error.borrow_mut() = Some(glib::Error::new(gio::IOErrorEnum::NotFound, "The folder was removed"));
+                self.state_changed();
+            }
+            return;
+        }
         let name = || file.basename().map(|b| b.to_string_lossy().to_string()).unwrap_or_default();
         match ev {
             E::Created | E::MovedIn | E::ChangesDoneHint | E::AttributeChanged => self.refresh_child(file),
@@ -259,10 +270,87 @@ impl DirModel {
             E::Changed | E::PreUnmount | E::Unmounted | E::Moved => {}
             _ => {}
         }
-        // the folder itself went away
-        if matches!(ev, E::Deleted | E::MovedOut) && self.file.borrow().as_ref().is_some_and(|d| d.equal(file)) {
-            *self.error.borrow_mut() = Some(glib::Error::new(gio::IOErrorEnum::NotFound, "The folder was removed"));
-            self.state_changed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(m: &DirModel) -> Vec<String> {
+        (0..m.n_items()).filter_map(|i| m.store.item(i).and_downcast::<gio::FileInfo>()).map(|i| i.name().to_string_lossy().to_string()).collect()
+    }
+    fn run(ctx: &glib::MainContext, ms: u64) {
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < end {
+            while ctx.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn events_about_the_folder_itself_are_not_entries() {
+        let ctx = glib::MainContext::new();
+        ctx.with_thread_default(|| {
+            let d = std::env::temp_dir().join(format!("burrow-dm-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            // a child with the same name as its folder
+            let same = d.file_name().unwrap().to_os_string();
+            std::fs::create_dir_all(d.join(&same)).unwrap();
+            std::fs::write(d.join("a"), "").unwrap();
+            let m = DirModel::new("standard::*");
+            let dir = gio::File::for_path(&d);
+            m.set_file(Some(&dir));
+            run(&ctx, 300);
+            assert_eq!(m.n_items(), 2);
+            // the folder itself changed
+            m.on_event(&dir, None, gio::FileMonitorEvent::AttributeChanged);
+            m.on_event(&dir, None, gio::FileMonitorEvent::ChangesDoneHint);
+            run(&ctx, 200);
+            assert_eq!(m.n_items(), 2, "{:?}", names(&m));
+            for i in 0..2 {
+                let f = m.store.item(i).and_downcast::<gio::FileInfo>().and_then(|i| i.attribute_object("standard::file")).and_downcast::<gio::File>().unwrap();
+                assert!(f.has_parent(Some(&dir)), "{}", f.uri());
+            }
+            // something moved out to another folder isn't an entry here
+            std::fs::create_dir_all(d.join(&same).join("elsewhere")).unwrap();
+            m.on_event(&dir.child("a"), Some(&dir.child(&same).child("elsewhere")), gio::FileMonitorEvent::Renamed);
+            run(&ctx, 200);
+            assert_eq!(names(&m), [same.to_string_lossy().to_string()]);
+            // the folder going away is an error page, and doesn't remove the namesake first
+            m.on_event(&dir, None, gio::FileMonitorEvent::Deleted);
+            assert!(m.error().is_some());
+            let _ = std::fs::remove_dir_all(&d);
+        })
+        .unwrap();
+    }
+
+    /// The real Trash: trash and restore a file while it's open. Run with --ignored.
+    #[test]
+    #[ignore]
+    fn trash_never_lists_itself() {
+        // GVFS reports changes on the main loop
+        let ctx = glib::MainContext::default();
+        let _owner = ctx.acquire().unwrap();
+        {
+            let home = glib::home_dir().join(".cache/burrow-test-trash");
+            std::fs::create_dir_all(&home).unwrap();
+            let f = home.join("burrow-restore-test.txt");
+            std::fs::write(&f, "x").unwrap();
+            let m = DirModel::new("standard::*,trash::orig-path");
+            m.set_file(Some(&gio::File::for_uri("trash:///")));
+            run(&ctx, 800);
+            let before = names(&m);
+            let (p, c) = (crate::ops::Progress::default(), gio::Cancellable::new());
+            let (_, since) = crate::ops::trash(&[gio::File::for_path(&f)], &p, &c);
+            run(&ctx, 1500);
+            let during = names(&m);
+            let items = crate::ops::match_trashed(&crate::ops::list_trash(&c), &[f.to_string_lossy().to_string()], since);
+            assert_eq!(crate::ops::restore(&items, &p, &c), 1);
+            run(&ctx, 1500);
+            let _ = std::fs::remove_dir_all(&home);
+            assert_eq!(during.len(), before.len() + 1, "{during:?}");
+            assert_eq!(names(&m), before, "Trash lists something it shouldn't");
         }
     }
 }
