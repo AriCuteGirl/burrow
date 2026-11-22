@@ -227,7 +227,7 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Burrow")
-        .icon_name("system-file-manager")
+        .icon_name("world.puppygirl.Burrow")
         .default_width(1280)
         .default_height(800)
         .decorated(false)
