@@ -15,7 +15,9 @@ cargo build --release
 install -Dm755 target/release/burrow "$BIN/burrow"
 install -Dm644 "data/icons/hicolor/scalable/apps/$ID.svg" "$DATA/icons/hicolor/scalable/apps/$ID.svg"
 mkdir -p "$DATA/applications"
-sed "s|^Exec=burrow|Exec=\"$BIN/burrow\"|" "data/$ID.desktop" > "$DATA/applications/$ID.desktop"
+# xdg-mime and xdg-open don't understand a quoted program, so quote only if the path needs it
+case "$BIN" in *[!A-Za-z0-9/._-]*) EXEC="\"$BIN/burrow\"" ;; *) EXEC="$BIN/burrow" ;; esac
+sed "s|^Exec=burrow|Exec=$EXEC|" "data/$ID.desktop" > "$DATA/applications/$ID.desktop"
 update-desktop-database "$DATA/applications" 2>/dev/null || true
 echo "Installed to $BIN/burrow"
 echo "Make it the default file manager with:  xdg-mime default $ID.desktop inode/directory"

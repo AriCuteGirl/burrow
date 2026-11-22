@@ -33,6 +33,8 @@ pub struct Config {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct AppearanceCfg {
+    /// "rice" to follow the active rice live, or the id of an installed rice to keep its look.
+    pub colors: String,
     /// "rice" to follow Hyprland rounding of the active rice, or a number of pixels.
     pub radius: RadiusCfg,
     /// Window background opacity (0.3–1.0) so Hyprland blur shows through.
@@ -129,6 +131,7 @@ pub struct FolderCfg {
 impl Default for AppearanceCfg {
     fn default() -> Self {
         AppearanceCfg {
+            colors: "rice".into(),
             radius: RadiusCfg::Mode("rice".into()),
             opacity: 0.94,
             font: "Google Sans Flex".into(),
@@ -304,6 +307,7 @@ impl Config {
 }
 
 const HEADER: &str = "# Burrow config. Edit freely: the app reloads this file when it changes.\n\
+# colors = \"rice\" follows your active rice live; a rice id (\"gravity-falls\") keeps that one.\n\
 # radius = \"rice\" follows your Hyprland rounding; a number (px) overrides it.\n\
 # Drives are keyed by UUID/label, so names and icons survive replugging.\n\n";
 

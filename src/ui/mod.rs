@@ -76,7 +76,9 @@ pub struct Win {
     sys_icon_theme: Option<String>,
     pub tokens: RefCell<Tokens>,
     provider: gtk::CssProvider,
-    paths: RicePaths,
+    pub(crate) paths: RicePaths,
+    /// the config's `colors` the current look was loaded for
+    colors: RefCell<String>,
     pub home: gio::File,
 
     pub drives: RefCell<Vec<Drive>>,
@@ -216,8 +218,8 @@ fn toggle_btn(icon: &str, tip: &str) -> gtk::ToggleButton {
 
 pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     let paths = RicePaths::from_env();
-    let tokens = theme::load_active(&paths);
     let (cfg, cfg_text, cfg_err) = load_config();
+    let tokens = theme::load_choice(&paths, &cfg.appearance.colors);
 
     let provider = gtk::CssProvider::new();
     if let Some(d) = gdk::Display::default() {
@@ -347,6 +349,7 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
     main.append(&statusbar);
 
     let home = gio::File::for_path(glib::home_dir());
+    let colors = cfg.appearance.colors.clone();
     let w = Rc::new(Win {
         window,
         cfg: RefCell::new(cfg),
@@ -360,6 +363,7 @@ pub fn open_window(app: &gtk::Application, start: Option<gio::File>) {
         drives: RefCell::new(drives::list()),
         volume_monitor: gio::VolumeMonitor::get(),
         rice_monitors: RefCell::new(vec![]),
+        colors: RefCell::new(colors),
         cfg_monitor: RefCell::new(None),
         debounce: RefCell::new(None),
         cfg_debounce: RefCell::new(None),
@@ -780,7 +784,8 @@ impl Win {
     /// Watch the switcher's `current` file and the active rice's files; re-theme on change.
     fn watch_rice(self: &Rc<Self>) {
         let mut files = vec![self.paths.current_file()];
-        if let Some(id) = theme::active_id(&self.paths) {
+        let choice = self.cfg.borrow().appearance.colors.clone();
+        if let Some(id) = theme::pinned_id(&self.paths, &choice).or_else(|| theme::active_id(&self.paths)) {
             if let Some(d) = theme::rice_dir(&self.paths, &id) {
                 files.push(d.join("rice.json"));
                 files.push(d.join("hypr/look.lua"));
@@ -819,15 +824,19 @@ impl Win {
             let Some(w) = weak.upgrade() else { return };
             *w.debounce.borrow_mut() = None;
             let paths = w.paths.clone();
+            let choice = w.cfg.borrow().appearance.colors.clone();
             let weak = Rc::downgrade(&w);
             glib::spawn_future_local(async move {
-                let Ok(t) = gio::spawn_blocking(move || theme::load_active(&paths)).await else { return };
+                let Ok(t) = gio::spawn_blocking(move || theme::load_choice(&paths, &choice)).await else { return };
                 let Some(w) = weak.upgrade() else { return };
                 let changed_rice = w.tokens.borrow().rice_id != t.rice_id;
                 if *w.tokens.borrow() != t {
                     *w.tokens.borrow_mut() = t;
                     w.apply_theme();
                     w.sidebar.rebuild(&w);
+                    if let Some(s) = w.settings.borrow().as_ref() {
+                        s.sync(&w);
+                    }
                 }
                 if changed_rice {
                     w.watch_rice();
@@ -889,6 +898,11 @@ impl Win {
     /// Re-apply everything that depends on the config (after a file edit or a UI change).
     pub fn config_changed(self: &Rc<Self>) {
         self.apply_theme();
+        let choice = self.cfg.borrow().appearance.colors.clone();
+        if self.colors.replace(choice.clone()) != choice {
+            self.watch_rice();
+            self.schedule_retheme();
+        }
         self.apply_keys();
         let cfg = self.cfg.borrow().clone();
         self.preview_rev.set_reveal_child(cfg.view.preview_pane);

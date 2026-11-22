@@ -15,6 +15,9 @@ const SORTS: [&str; 4] = ["name", "size", "modified", "type"];
 pub struct Settings {
     pub window: gtk::Window,
     syncing: Rc<Cell<bool>>,
+    colors: gtk::DropDown,
+    /// installed rice ids, in the dropdown's order (after "Follow the rice")
+    rices: Rc<RefCell<Vec<String>>>,
     radius_mode: gtk::DropDown,
     radius_px: gtk::SpinButton,
     opacity: gtk::Scale,
@@ -148,6 +151,8 @@ impl Settings {
 
         // ---------------- appearance
         let g = group(&root, "APPEARANCE");
+        let colors = dropdown(&["Follow the rice"]);
+        row(&g, "Colours", "Follow the rice you have on, or always use one rice's look", &colors);
         let rbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let radius_mode = dropdown(&["Follow the rice", "Custom"]);
         let radius_px = gtk::SpinButton::with_range(0.0, 32.0, 1.0);
@@ -226,6 +231,8 @@ impl Settings {
         let s = Settings {
             window,
             syncing: Rc::new(Cell::new(false)),
+            colors,
+            rices: Rc::new(RefCell::new(vec![])),
             radius_mode,
             radius_px,
             opacity,
@@ -249,6 +256,7 @@ impl Settings {
         };
         s.connect(w, &close, &done, &open);
         s.load_icon_themes(w);
+        s.load_rices(w);
         s
     }
 
@@ -291,6 +299,12 @@ impl Settings {
             }
         };
 
+        let (e, rices) = (edit.clone(), self.rices.clone());
+        self.colors.connect_selected_notify(move |d| {
+            let i = d.selected() as usize;
+            let v = i.checked_sub(1).and_then(|i| rices.borrow().get(i).cloned()).unwrap_or_else(|| "rice".into());
+            e(Box::new(move |c| c.appearance.colors = v));
+        });
         let (e, px) = (edit.clone(), self.radius_px.clone());
         self.radius_mode.connect_selected_notify(move |d| {
             let custom = d.selected() == 1;
@@ -422,10 +436,33 @@ impl Settings {
         });
     }
 
+    /// Installed rices, for the Colours dropdown.
+    fn load_rices(&self, w: &Rc<Win>) {
+        let (weak, paths) = (Rc::downgrade(w), w.paths.clone());
+        glib::spawn_future_local(async move {
+            let Ok(list) = gio::spawn_blocking(move || theme::list_rices(&paths)).await else { return };
+            let Some(w) = weak.upgrade() else { return };
+            let Some(s) = w.settings.borrow().as_ref().map(|s| (s.colors.clone(), s.rices.clone(), s.syncing.clone())) else { return };
+            let (dd, store, syncing) = s;
+            let mut labels = vec!["Follow the rice".to_string()];
+            labels.extend(list.iter().map(|(_, n)| n.clone()));
+            *store.borrow_mut() = list.into_iter().map(|(id, _)| id).collect();
+            let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+            syncing.set(true);
+            dd.set_model(Some(&gtk::StringList::new(&refs)));
+            syncing.set(false);
+            if let Some(s) = w.settings.borrow().as_ref() {
+                s.sync(&w);
+            }
+        });
+    }
+
     /// Controls follow the config (called after any config change).
     pub fn sync(&self, w: &Rc<Win>) {
         let c = w.cfg.borrow().clone();
         self.syncing.set(true);
+        let pos = self.rices.borrow().iter().position(|id| *id == c.appearance.colors.trim());
+        self.colors.set_selected(pos.map_or(0, |i| i as u32 + 1));
         match c.appearance.radius {
             RadiusCfg::Px(p) => {
                 self.radius_mode.set_selected(1);

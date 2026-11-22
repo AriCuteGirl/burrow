@@ -182,6 +182,38 @@ pub fn load_active(paths: &RicePaths) -> Tokens {
     load_rice(paths, id)
 }
 
+/// The look for the config's `colors`: "rice" (or anything that isn't installed) follows the
+/// active rice, a rice id keeps that rice.
+pub fn load_choice(paths: &RicePaths, choice: &str) -> Tokens {
+    match pinned_id(paths, choice) {
+        Some(id) => load_rice(paths, &id),
+        None => load_active(paths),
+    }
+}
+
+/// The rice id `choice` pins, if there is such a rice.
+pub fn pinned_id(paths: &RicePaths, choice: &str) -> Option<String> {
+    let id = choice.trim();
+    (id != "rice" && is_safe_id(id) && paths.rices.join(id).join("rice.json").is_file()).then(|| id.to_string())
+}
+
+/// Installed rices as (id, name), sorted by name.
+pub fn list_rices(paths: &RicePaths) -> Vec<(String, String)> {
+    let Ok(rd) = fs::read_dir(&paths.rices) else { return vec![] };
+    let mut v: Vec<(String, String)> = rd
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|id| is_safe_id(id) && id != "rice")
+        .filter_map(|id| {
+            let rice = serde_json_lite(&fs::read_to_string(paths.rices.join(&id).join("rice.json")).ok()?)?;
+            let name = rice.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| id.clone());
+            Some((id, name))
+        })
+        .collect();
+    v.sort_by(|a, b| crate::util::natural_cmp(&a.1, &b.1));
+    v
+}
+
 pub fn load_rice(paths: &RicePaths, id: &str) -> Tokens {
     let mut t = Tokens::lucid_blocks();
     if !is_safe_id(id) {
@@ -417,6 +449,8 @@ pub fn css(t: &Tokens, a: &Appearance) -> String {
         ("accent_color", t.accent_hot.hex()),
         ("accent_bg_color", t.accent.hex()),
         ("accent_fg_color", t.on_accent.hex()),
+        ("theme_selected_bg_color", t.wine.hex()),
+        ("theme_selected_fg_color", t.text.hex()),
     ];
     for (k, v) in vars {
         s.push_str(&format!("@define-color {k} {v};\n"));
@@ -642,6 +676,25 @@ mod tests {
         assert_eq!(t.shadow_color, "rgba(121,35,89,1.000)");
         // bg_deep is derived because colors[0] == surface
         assert!(t.bg_deep.luminance() < t.bg.luminance());
+    }
+
+    #[test]
+    fn colours_can_be_pinned_to_a_rice() {
+        let (_r, p) = fixture("pin");
+        fs::write(p.current_file(), "aaa\n").unwrap();
+        for (id, name, accent) in [("aaa", "Zebra", "#112233"), ("bbb", "Apple", "#C94277")] {
+            fs::create_dir_all(p.rices.join(id)).unwrap();
+            let json = format!(r##"{{"id":"{id}","name":"{name}","theme":{{"accent":"{accent}"}}}}"##);
+            fs::write(p.rices.join(id).join("rice.json"), json).unwrap();
+        }
+        fs::create_dir_all(p.rices.join("broken")).unwrap();
+        assert_eq!(list_rices(&p), [("bbb".into(), "Apple".into()), ("aaa".into(), "Zebra".into())] as [(String, String); 2]);
+        assert_eq!(load_choice(&p, "rice").rice_id, "aaa");
+        assert_eq!(load_choice(&p, "bbb").accent, Rgb(0xc9, 0x42, 0x77));
+        // a removed or odd rice follows the active one instead
+        for odd in ["gone", "broken", "", "../bbb"] {
+            assert_eq!(load_choice(&p, odd).rice_id, "aaa", "{odd}");
+        }
     }
 
     #[test]

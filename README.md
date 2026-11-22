@@ -56,6 +56,7 @@ with a mistake in it is never overwritten, and passwords never end up in it.
 
 ```toml
 [appearance]
+colors = "rice"          # follow the active rice, or always one: "gravity-falls"
 radius = "rice"          # or a number of pixels
 folder_color = "rice"    # "none", or a Papirus colour: red, pink, violet…
 

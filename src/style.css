@@ -280,7 +280,10 @@ popover > contents, popover.menu > contents {
 }
 popover > arrow { background: @surface; border-color: @crimson; }
 popover modelbutton { border-radius: $R_SMALL; padding: 6px 10px; color: @text_dim; }
-popover modelbutton:hover { background: @surface_alt; color: @text; }
+popover modelbutton:hover,
+popover modelbutton:selected,
+popover modelbutton:focus,
+popover modelbutton:active { background: @surface_alt; color: @text; box-shadow: none; outline: none; }
 
 tooltip, tooltip.background {
   background: @bg_deep;
@@ -440,6 +443,7 @@ scale trough { background: alpha(@text, 0.12); border-radius: 99px; min-height: 
 scale highlight { background: @accent; border-radius: 99px; }
 scale slider { background: @text; border-radius: 99px; min-width: 14px; min-height: 14px; border: none; box-shadow: none; }
 scale value { color: @text_faint; font-size: 11px; }
+popover listview, popover list { background: transparent; color: @text_dim; }
 popover listview row:hover, popover.menu row:hover { background: @surface_alt; }
 popover listview row:selected { background: @sel_bg; }
 
